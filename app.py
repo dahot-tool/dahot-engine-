@@ -100,9 +100,15 @@ def resolve(payload: dict, x_dt_key: str = Header(default="")):
     for f in info.get("formats", []):
         if f.get("vcodec") in (None, "none"):
             continue
+        w = f.get("width")
+        h = f.get("height")
+        # Quality tier ("720p") is the SMALLER dimension: for portrait videos
+        # yt-dlp's height is the long side, so use min(width, height).
+        tier = min(w, h) if (w and h and w > 0 and h > 0) else h
         formats.append({
             "id": f.get("format_id"),
-            "height": f.get("height"),
+            "height": tier,
+            "width": w,
             "ext": f.get("ext"),
             "size": f.get("filesize") or f.get("filesize_approx"),
             "has_audio": f.get("acodec") not in (None, "none"),

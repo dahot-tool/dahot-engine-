@@ -33,6 +33,19 @@ MAX_HEIGHT_FREE = 720  # the site passes plan info; kept simple for now
 app = FastAPI(title="Dahot Tool Engine")
 
 
+@app.exception_handler(Exception)
+async def unhandled(request, exc):
+    # Never fail silently: return the real error to the (key-holding) caller
+    # and print it, so a broken host environment is diagnosable without logs.
+    import traceback
+    traceback.print_exc()
+    return JSONResponse(status_code=500, content={
+        "ok": False,
+        "error": type(exc).__name__ + ": " + str(exc)[:300],
+        "trace": traceback.format_exc()[-1500:],
+    })
+
+
 def check_key(x_dt_key: str = Header(default="")):
     if ENGINE_KEY and x_dt_key != ENGINE_KEY:
         raise HTTPException(status_code=403, detail="forbidden")
@@ -52,6 +65,7 @@ def ydl_opts(extra=None):
         },
     }
     try:
+        import curl_cffi  # noqa: F401  (impersonation backend; must be installed)
         from yt_dlp.networking.impersonate import ImpersonateTarget
         opts["impersonate"] = ImpersonateTarget("chrome")
     except Exception:

@@ -1,0 +1,21 @@
+# Render Blueprint — Dahot Tool download engine (free plan, Docker).
+# Deploy: in Render, "New +" -> "Blueprint" -> connect the GitHub repo
+# containing this folder as its root (dahot-engine). Render reads this file
+# and creates the web service; no card is needed on the free plan.
+# NOTE: Render sets $PORT itself at runtime; app.py already reads $PORT
+# (default 8000), so the Dockerfile's ENV PORT=7860 is overridden there.
+# After deploy, copy the generated DT_ENGINE_KEY from Render's Environment
+# tab into the Dahot Tool site config — the site must send it as the
+# X-DT-Key header, or the engine answers 403.
+services:
+  - type: web
+    name: dahot-engine
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: DT_ENGINE_KEY
+        generateValue: true
+      - key: PYTHONUNBUFFERED
+        value: "1"

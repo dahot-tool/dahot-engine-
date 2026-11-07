@@ -4,6 +4,10 @@
 A small HTTP service around yt-dlp:
   GET  /health                 -> {"ok": true}
   POST /resolve {"url": ...}   -> video info + downloadable format list
+                                  (playlist URLs return the playlist shape)
+  POST /playlist {"url": ...}  -> playlist listing: entries with ready-to-
+                                  fetch watch URLs (feed each entry URL to
+                                  /fetch to download it)
   GET  /fetch?u=<url>&f=<fmt>  -> streams the file through this server with
                                   Content-Disposition: attachment, so the
                                   browser saves it into the device Downloads
@@ -85,6 +89,48 @@ def health():
     return {"ok": True, "engine": "yt-dlp " + yt_dlp.version.__version__}
 
 
+def extract_playlist(url: str) -> dict:
+    """Flat playlist extraction: list up to 50 entries without resolving
+    each video, so playlist/collection URLs return something useful.
+    Each entry's url is the watch URL /fetch can download directly."""
+    opts = ydl_opts({"extract_flat": "in_playlist", "playlistend": 50})
+    opts.pop("noplaylist", None)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    entries = []
+    for e in info.get("entries") or []:
+        if not e:
+            continue
+        thumb = e.get("thumbnail")
+        if not thumb and e.get("thumbnails"):
+            thumb = e["thumbnails"][-1].get("url")
+        entries.append({
+            "id": e.get("id"),
+            "title": e.get("title"),
+            "url": e.get("url") or e.get("webpage_url"),
+            "duration": e.get("duration"),
+            "thumbnail": thumb,
+        })
+    return {
+        "is_playlist": True,
+        "title": info.get("title"),
+        "count": len(entries),
+        "entries": entries,
+    }
+
+
+@app.post("/playlist")
+def playlist(payload: dict, x_dt_key: str = Header(default="")):
+    check_key(x_dt_key)
+    url = (payload or {}).get("url", "").strip()
+    if not url or not re.match(r"^https?://", url):
+        raise HTTPException(status_code=400, detail="bad url")
+    try:
+        return extract_playlist(url)
+    except yt_dlp.utils.DownloadError as e:
+        raise HTTPException(status_code=422, detail=str(e)[:300])
+
+
 @app.post("/resolve")
 def resolve(payload: dict, x_dt_key: str = Header(default="")):
     check_key(x_dt_key)
@@ -96,6 +142,13 @@ def resolve(payload: dict, x_dt_key: str = Header(default="")):
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=422, detail=str(e)[:300])
+    if info.get("_type") == "playlist" or "entries" in info:
+        # Playlist URL: the single-video path yields zero formats, so
+        # answer with the playlist listing instead.
+        try:
+            return extract_playlist(url)
+        except yt_dlp.utils.DownloadError as e:
+            raise HTTPException(status_code=422, detail=str(e)[:300])
     formats = []
     for f in info.get("formats", []):
         if f.get("vcodec") in (None, "none"):

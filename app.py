@@ -55,19 +55,31 @@ def check_key(x_dt_key: str = Header(default="")):
         raise HTTPException(status_code=403, detail="forbidden")
 
 
-def ydl_opts(extra=None):
+def ydl_opts(extra=None, player_client="KEEP"):
+    """Build yt-dlp options. player_client controls the YouTube extractor's
+    player_client argument:
+      "KEEP" (default) -> the long-standing combo below; every non-YouTube
+                          path and /fetch use exactly this, unchanged.
+      None             -> yt-dlp's built-in default client set (no override).
+      [names]          -> exactly those clients, in order.
+    """
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "socket_timeout": 30,
         "retries": 2,
-        "extractor_args": {
+    }
+    if player_client == "KEEP":
+        opts["extractor_args"] = {
             # YouTube walls off the default web client from datacenter IPs;
             # these clients are the ones that still answer there.
             "youtube": {"player_client": ["android", "tv_embedded", "web_embedded"]},
-        },
-    }
+        }
+    elif player_client is not None:
+        opts["extractor_args"] = {
+            "youtube": {"player_client": list(player_client)},
+        }
     try:
         import curl_cffi  # noqa: F401  (impersonation backend; must be installed)
         from yt_dlp.networking.impersonate import ImpersonateTarget
@@ -77,6 +89,60 @@ def ydl_opts(extra=None):
     if extra:
         opts.update(extra)
     return opts
+
+
+YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+
+
+def is_youtube_url(url: str) -> bool:
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower().split(":")[0]
+    except Exception:
+        return False
+    return any(host == h or host.endswith("." + h) for h in YOUTUBE_HOSTS)
+
+
+# Player-client strategies tried in order for YouTube URLs (no cookies are
+# available to this engine): the first strategy whose extraction succeeds
+# wins; a bot-wall error ("Sign in to confirm you're not a bot") or any
+# other extraction failure falls through to the next strategy. The final
+# entry is the long-standing combo, so YouTube behaviour can only improve
+# on the old single path, never regress below it.
+YT_CLIENT_STRATEGIES = [
+    None,  # yt-dlp built-in default
+    ["tv"],
+    ["ios"],
+    ["android"],
+    ["web_safari"],
+    ["mweb"],
+    ["android", "tv_embedded", "web_embedded"],
+]
+
+
+def _client_label(player_client) -> str:
+    return "default" if player_client is None else "+".join(player_client)
+
+
+def cycle_youtube(fn):
+    """Run fn(player_client) across YT_CLIENT_STRATEGIES; first success
+    wins. Returns (result, client_label). Re-raises the last DownloadError
+    when every strategy fails."""
+    last_err = None
+    for pc in YT_CLIENT_STRATEGIES:
+        try:
+            result = fn(pc)
+            print(f"[yt-cycle] OK via {_client_label(pc)}", flush=True)
+            return result, _client_label(pc)
+        except yt_dlp.utils.DownloadError as e:
+            last_err = e
+            print(f"[yt-cycle] failed via {_client_label(pc)}: {str(e)[:140]}",
+                  flush=True)
+    raise last_err
+
+
+def extract_once(url, extra=None, player_client="KEEP"):
+    with yt_dlp.YoutubeDL(ydl_opts(extra, player_client=player_client)) as ydl:
+        return ydl.extract_info(url, download=False)
 
 
 def safe_name(title: str) -> str:
@@ -89,11 +155,12 @@ def health():
     return {"ok": True, "engine": "yt-dlp " + yt_dlp.version.__version__}
 
 
-def extract_playlist(url: str) -> dict:
+def extract_playlist(url: str, player_client="KEEP") -> dict:
     """Flat playlist extraction: list up to 50 entries without resolving
     each video, so playlist/collection URLs return something useful.
     Each entry's url is the watch URL /fetch can download directly."""
-    opts = ydl_opts({"extract_flat": "in_playlist", "playlistend": 50})
+    opts = ydl_opts({"extract_flat": "in_playlist", "playlistend": 50},
+                    player_client=player_client)
     opts.pop("noplaylist", None)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -126,6 +193,11 @@ def playlist(payload: dict, x_dt_key: str = Header(default="")):
     if not url or not re.match(r"^https?://", url):
         raise HTTPException(status_code=400, detail="bad url")
     try:
+        if is_youtube_url(url):
+            result, label = cycle_youtube(
+                lambda pc: extract_playlist(url, player_client=pc))
+            result["yt_client"] = label
+            return result
         return extract_playlist(url)
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=422, detail=str(e)[:300])
@@ -137,15 +209,24 @@ def resolve(payload: dict, x_dt_key: str = Header(default="")):
     url = (payload or {}).get("url", "").strip()
     if not url or not re.match(r"^https?://", url):
         raise HTTPException(status_code=400, detail="bad url")
+    yt_client = None
     try:
-        with yt_dlp.YoutubeDL(ydl_opts()) as ydl:
-            info = ydl.extract_info(url, download=False)
+        if is_youtube_url(url):
+            info, yt_client = cycle_youtube(
+                lambda pc: extract_once(url, player_client=pc))
+        else:
+            info = extract_once(url)
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=422, detail=str(e)[:300])
     if info.get("_type") == "playlist" or "entries" in info:
         # Playlist URL: the single-video path yields zero formats, so
         # answer with the playlist listing instead.
         try:
+            if is_youtube_url(url):
+                result, label = cycle_youtube(
+                    lambda pc: extract_playlist(url, player_client=pc))
+                result["yt_client"] = label
+                return result
             return extract_playlist(url)
         except yt_dlp.utils.DownloadError as e:
             raise HTTPException(status_code=422, detail=str(e)[:300])
@@ -167,7 +248,7 @@ def resolve(payload: dict, x_dt_key: str = Header(default="")):
             "has_audio": f.get("acodec") not in (None, "none"),
         })
     formats.sort(key=lambda x: (x["height"] or 0))
-    return {
+    result = {
         "title": info.get("title"),
         "artist": info.get("uploader") or info.get("channel"),
         "duration": info.get("duration"),
@@ -175,6 +256,10 @@ def resolve(payload: dict, x_dt_key: str = Header(default="")):
         "webpage_url": info.get("webpage_url"),
         "formats": formats,
     }
+    if yt_client is not None:
+        # Which player_client strategy got past the YouTube bot wall.
+        result["yt_client"] = yt_client
+    return result
 
 
 @app.get("/fetch")
@@ -244,9 +329,13 @@ def subs(payload: dict, x_dt_key: str = Header(default="")):
         raise HTTPException(status_code=400, detail="bad url")
     import io
     import urllib.request as ureq
+    yt_client = None
     try:
-        with yt_dlp.YoutubeDL(ydl_opts()) as ydl:
-            info = ydl.extract_info(url, download=False)
+        if is_youtube_url(url):
+            info, yt_client = cycle_youtube(
+                lambda pc: extract_once(url, player_client=pc))
+        else:
+            info = extract_once(url)
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=422, detail=str(e)[:300])
     tracks = {}
@@ -290,8 +379,11 @@ def subs(payload: dict, x_dt_key: str = Header(default="")):
             if line and (not lines or lines[-1] != line):
                 lines.append(line)
         text = "\n".join(lines)
-    return {"title": info.get("title"), "lang": want,
-            "available": sorted(tracks), "text": text}
+    result = {"title": info.get("title"), "lang": want,
+              "available": sorted(tracks), "text": text}
+    if yt_client is not None:
+        result["yt_client"] = yt_client
+    return result
 
 
 if __name__ == "__main__":

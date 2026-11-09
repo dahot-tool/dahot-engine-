@@ -81,15 +81,15 @@ def _load_cookies():
 COOKIEFILE = _load_cookies()
 
 # PO-token provider (bgutil-ytdlp-pot-provider 2.0.2, plugin + server in
-# lockstep). In production the server runs as a sidecar INSIDE this
-# container on loopback (see space/pot/ and space/start.sh), so the
-# default points there and tokens are minted from the same egress as the
-# downloads themselves. POT_PROVIDER_URL="" disables the provider (the
-# engine then behaves exactly as before); a full URL points at an
-# external provider instead. The URL is not a secret, but per the
-# integration note it is never published on the site.
+# lockstep). PRODUCTION VERDICT 2026-11-09: the sidecar ran inside this
+# container, tokens were minted and presented (container logs prove it),
+# and YouTube STILL returned storyboard-only formats for every client —
+# the wall is this datacenter egress, not the token. The provider is
+# therefore DISABLED by default (it also idles at ~200 MB of the free
+# container's 256 MB). Set POT_PROVIDER_URL to a provider URL to retry
+# this route in the future; "" (the default) is the pre-POT behaviour.
 POT_PROVIDER_URL = os.environ.get(
-    "POT_PROVIDER_URL", "http://127.0.0.1:4416").strip()
+    "POT_PROVIDER_URL", "").strip()
 print(f"[pot] PO-token provider: {POT_PROVIDER_URL or 'disabled'}",
       flush=True)
 

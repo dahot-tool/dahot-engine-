@@ -166,6 +166,8 @@ def is_youtube_url(url: str) -> bool:
 # long-standing combo, so YouTube behaviour can only improve on the old
 # single path, never regress below it.
 YT_CLIENT_STRATEGIES = [
+    (["tv_downgraded"], True),
+    (["tv_downgraded"], False),
     (["android_vr"], True),
     (["tv"], False),
     (["android_vr"], False),

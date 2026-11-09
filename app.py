@@ -23,7 +23,9 @@ import base64
 import os
 import re
 import sys
+import time
 import urllib.parse
+import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 
@@ -152,6 +154,354 @@ def is_youtube_url(url: str) -> bool:
     except Exception:
         return False
     return any(host == h or host.endswith("." + h) for h in YOUTUBE_HOSTS)
+
+
+# ---------------------------------------------------------------------------
+# TeraBox: yt-dlp has no extractor for it, so shares are resolved through
+# TeraBox's own sharing API with the spare account's session. Only the
+# `ndus` cookie is ever sent (env TERABOX_NDUS): the combined cookie jar
+# belongs to yt-dlp, and TeraBox's download hosts reject a fetch carrying
+# anything more than ndus. The flow is shorturlinfo for the file list
+# (its own dlink field comes back empty) followed by sharedownload,
+# which exchanges the share's sign/timestamp + the file ids for the real
+# dlinks. dlinks are short-lived, so /fetch re-resolves the share at
+# download time and never stores or hands out a dlink.
+TERABOX_NDUS = os.environ.get("TERABOX_NDUS", "").strip()
+TERABOX_HOSTS = ("terabox.com", "teraboxapp.com", "1024terabox.com",
+                 "1024tera.com", "terabox.app", "mirrobox.com",
+                 "freemb.com", "gibibox.com", "momerybox.com",
+                 "terasharelink.com", "teraboxlink.com", "nephobox.com",
+                 "4funbox.com", "freeterabox.com", "tibibox.com",
+                 "terafileshare.com", "teraboxshare.com")
+TB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+         "AppleWebKit/537.36 (KHTML, like Gecko) "
+         "Chrome/126.0.0.0 Safari/537.36")
+TB_VIDEO_EXTS = {"mp4", "mkv", "avi", "mov", "webm", "m4v", "ts",
+                 "flv", "wmv", "mpg", "mpeg", "3gp"}
+
+
+def is_terabox_url(url: str) -> bool:
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower().split(":")[0]
+    except Exception:
+        return False
+    return any(host == h or host.endswith("." + h) for h in TERABOX_HOSTS)
+
+
+def _tb_shorturl_id(url: str):
+    """Share id from a /s/<id> path or a ?surl= / ?shorturl= query."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return None
+    m = re.search(r"/s/([A-Za-z0-9_\-]+)", parsed.path or "")
+    if m:
+        return m.group(1)
+    qs = urllib.parse.parse_qs(parsed.query or "")
+    for key in ("surl", "shorturl"):
+        if qs.get(key):
+            return qs[key][0]
+    return None
+
+
+def _tb_api_host(url: str) -> str:
+    """API calls go to the share's own host: dlinks are bound to the
+    issuing domain, so a mirror link must be resolved on that mirror."""
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower().split(":")[0]
+    except Exception:
+        host = ""
+    if any(host == h or host.endswith("." + h) for h in TERABOX_HOSTS):
+        return host
+    return "www.terabox.com"
+
+
+class _TbRedirect(urllib.request.HTTPRedirectHandler):
+    """Keep the session ndus-only on every redirect hop (dlink hosts)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return urllib.request.Request(
+            newurl,
+            headers={"User-Agent": TB_UA,
+                     "Cookie": "ndus=" + TERABOX_NDUS,
+                     "Referer": "https://www.terabox.com/"},
+            origin_req_host=req.origin_req_host,
+            unverifiable=True,
+        )
+
+
+def _tb_open(req):
+    opener = urllib.request.build_opener(_TbRedirect())
+    return opener.open(req, timeout=60)
+
+
+def _tb_get_json(api_url: str) -> dict:
+    import json as _json
+    req = urllib.request.Request(api_url, headers={
+        "User-Agent": TB_UA,
+        "Cookie": "ndus=" + TERABOX_NDUS,
+        "Referer": "https://www.terabox.com/",
+        "Accept": "application/json, text/plain, */*",
+    })
+    with _tb_open(req) as resp:
+        return _json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _tb_shorturlinfo(host: str, surl: str) -> dict:
+    def call(sid):
+        api = ("https://" + host + "/api/shorturlinfo?" +
+               urllib.parse.urlencode({"shorturl": sid, "root": 1}))
+        return _tb_get_json(api)
+
+    data = call(surl)
+    if data.get("errno") != 0 and surl.startswith("1") and len(surl) > 8:
+        # Some issuers register the share without its leading "1".
+        retry = call(surl[1:])
+        if retry.get("errno") == 0:
+            return retry
+    return data
+
+
+def _tb_post_json(api_url: str, form: dict) -> dict:
+    import json as _json
+    req = urllib.request.Request(
+        api_url, data=urllib.parse.urlencode(form).encode(), headers={
+            "User-Agent": TB_UA,
+            "Cookie": "ndus=" + TERABOX_NDUS,
+            "Referer": "https://www.terabox.com/",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/x-www-form-urlencoded",
+        })
+    with _tb_open(req) as resp:
+        return _json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _tb_sharedownload(host: str, info: dict, fs_ids: list) -> dict:
+    """Exchange the share's sign/timestamp + file ids for real dlinks.
+    Returns {fs_id: dlink}; empty when TeraBox refuses."""
+    import json as _json
+    ids = []
+    for i in fs_ids:
+        try:
+            ids.append(int(i))
+        except (TypeError, ValueError):
+            continue
+    if not ids or not info.get("sign"):
+        return {}
+    query = urllib.parse.urlencode({
+        "app_id": 250528, "channel": "chunlei", "clienttype": 12,
+        "web": 1, "sign": info.get("sign") or "",
+        "timestamp": info.get("timestamp") or "",
+    })
+    form = {
+        "encrypt": 0,
+        "extra": _json.dumps({"sekey": info.get("randsk") or ""}),
+        "fid_list": _json.dumps(ids),
+        "primaryid": info.get("shareid"),
+        "uk": info.get("uk"),
+        "product": "share",
+        "type": "nolimit",
+    }
+    data = _tb_post_json("https://" + host + "/api/sharedownload?" + query,
+                         form)
+    if data.get("errno") != 0:
+        return {}
+    return {str(it.get("fs_id")): it.get("dlink")
+            for it in data.get("list") or [] if it.get("dlink")}
+
+
+def _tb_list_dir(host: str, surl: str, dir_path: str) -> list:
+    params = {"order": "name", "desc": 0, "shorturl": surl,
+              "dir": dir_path, "root": 0, "page": 1, "num": 100, "web": 1}
+    data = _tb_get_json("https://" + host + "/api/list?" +
+                        urllib.parse.urlencode(params))
+    if data.get("errno") != 0:
+        return []
+    return data.get("list") or []
+
+
+# TeraBox rate-limits share lookups per egress IP (observed locally:
+# after a burst of calls, shorturlinfo answers errno 400141 to every
+# identity until the window refills). The site's normal flow resolves a
+# share and fetches from it seconds later, so a resolution is reused
+# for 120 s — the dlink stays fresh (they live far longer), and a
+# resolve+fetch pair costs TeraBox one lookup sequence, not two.
+_TB_CACHE = {}
+TB_CACHE_TTL = 120
+
+
+def _tb_cache_key(url: str) -> str:
+    try:
+        p = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(p.query)
+        qs.pop("dtfid", None)
+        return urllib.parse.urlunparse(
+            p._replace(query=urllib.parse.urlencode(qs, doseq=True)))
+    except Exception:
+        return url
+
+
+def _tb_collect_files(url: str):
+    """Resolve a TeraBox share URL to its downloadable file entries.
+    Raises HTTPException with a clean detail on any TeraBox-side refusal
+    (bad link, verification demand, empty dlink) instead of crashing."""
+    if not TERABOX_NDUS:
+        raise HTTPException(status_code=422,
+                            detail="terabox: sign-in cookie not configured")
+    key = _tb_cache_key(url)
+    hit = _TB_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < TB_CACHE_TTL:
+        return [dict(f) for f in hit[1]]
+    surl = _tb_shorturl_id(url)
+    if not surl:
+        raise HTTPException(status_code=422, detail="terabox: bad share link")
+    host = _tb_api_host(url)
+    try:
+        data = _tb_shorturlinfo(host, surl)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"terabox: lookup failed ({type(e).__name__})")
+    if data.get("errno") != 0 and host != "www.terabox.com":
+        # Mirror hosts intermittently demand verification (errno
+        # 460030); the same share answers on the main host.
+        try:
+            retry = _tb_shorturlinfo("www.terabox.com", surl)
+            if retry.get("errno") == 0:
+                data, host = retry, "www.terabox.com"
+        except Exception:
+            pass
+    errno = data.get("errno")
+    if errno != 0:
+        raise HTTPException(
+            status_code=422,
+            detail=f"terabox: share lookup refused (errno {errno})")
+    files = []
+
+    def walk(items, depth):
+        for item in items or []:
+            if str(item.get("isdir")) == "1":
+                if depth < 3 and len(files) < 50:
+                    try:
+                        sub = _tb_list_dir(host, surl, item.get("path") or "/")
+                    except Exception:
+                        sub = []
+                    walk(sub, depth + 1)
+            else:
+                files.append(item)
+
+    walk(data.get("list"), 0)
+    # shorturlinfo's own dlink field is always empty; the real links
+    # come from sharedownload, keyed by fs_id.
+    try:
+        links = _tb_sharedownload(host, data,
+                                  [it.get("fs_id") for it in files])
+    except Exception:
+        links = {}
+    for it in files:
+        if not it.get("dlink"):
+            it["dlink"] = links.get(str(it.get("fs_id")))
+    files = [f for f in files if f.get("dlink")][:50]
+    if not files:
+        raise HTTPException(
+            status_code=422,
+            detail="terabox: no downloadable file (dlink empty)")
+    _TB_CACHE[key] = (time.monotonic(), files)
+    return files
+
+
+def _tb_file_ext(item) -> str:
+    name = item.get("server_filename") or ""
+    return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+def _tb_thumb(item):
+    thumbs = item.get("thumbs") or {}
+    return thumbs.get("url3") or thumbs.get("url2") or thumbs.get("url1")
+
+
+def resolve_terabox(url: str) -> dict:
+    files = _tb_collect_files(url)
+    if len(files) > 1:
+        # Multi-file share: same playlist shape the yt-dlp path returns;
+        # each entry URL carries its fs_id so /fetch can pick the file.
+        sep = "&" if "?" in url else "?"
+        entries = [{
+            "id": str(item.get("fs_id")),
+            "title": item.get("server_filename"),
+            "url": f"{url}{sep}dtfid={item.get('fs_id')}",
+            "duration": None,
+            "thumbnail": _tb_thumb(item),
+        } for item in files]
+        return {"is_playlist": True, "title": "TeraBox share",
+                "count": len(entries), "entries": entries}
+    item = files[0]
+    ext = _tb_file_ext(item)
+    name = item.get("server_filename") or "TeraBox file"
+    title = name.rsplit(".", 1)[0] if "." in name else name
+    size = item.get("size")
+    return {
+        "title": title,
+        "artist": "TeraBox",
+        "duration": None,
+        "thumbnail": _tb_thumb(item),
+        "webpage_url": url,
+        "formats": [{
+            "id": str(item.get("fs_id")),
+            "height": 0,
+            "width": None,
+            "ext": ext or None,
+            "size": int(size) if str(size or "").isdigit() else None,
+            "has_audio": ext in TB_VIDEO_EXTS,
+        }],
+    }
+
+
+def fetch_terabox(u: str, f: str):
+    """Stream a TeraBox share's file: re-resolve the share so the dlink
+    is fresh, then GET it with only the ndus cookie and proxy it through
+    with Content-Disposition: attachment, like the yt-dlp /fetch path."""
+    files = _tb_collect_files(u)
+    want = (f or "").strip()
+    if not want:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+        want = (qs.get("dtfid") or [""])[0]
+    item = next((c for c in files if str(c.get("fs_id")) == want), files[0])
+    req = urllib.request.Request(item["dlink"], headers={
+        "User-Agent": TB_UA,
+        "Cookie": "ndus=" + TERABOX_NDUS,
+        "Referer": "https://www.terabox.com/",
+    })
+    try:
+        resp = _tb_open(req)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"terabox: download failed ({type(e).__name__})")
+    name = item.get("server_filename") or "terabox-file"
+    ext = _tb_file_ext(item)
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    filename = safe_name(stem) + ("." + ext if ext else "")
+    headers = {
+        "Content-Disposition": "attachment; filename*=UTF-8''"
+                               + urllib.parse.quote(filename),
+    }
+    length = resp.headers.get("Content-Length")
+    if length:
+        headers["Content-Length"] = length
+    ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+
+    def stream():
+        try:
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            resp.close()
+
+    return StreamingResponse(stream(), media_type=ctype, headers=headers)
 
 
 # Player-client strategies tried in order for YouTube URLs, as
@@ -284,6 +634,10 @@ def resolve(payload: dict, x_dt_key: str = Header(default="")):
     url = (payload or {}).get("url", "").strip()
     if not url or not re.match(r"^https?://", url):
         raise HTTPException(status_code=400, detail="bad url")
+    if is_terabox_url(url):
+        # yt-dlp has no TeraBox extractor; the sharing-API branch
+        # raises its own clean HTTPExceptions on any refusal.
+        return resolve_terabox(url)
     yt_client = None
     try:
         if is_youtube_url(url):
@@ -344,6 +698,9 @@ def fetch(u: str, f: str = "", x_dt_key: str = Header(default="")):
     check_key(x_dt_key)
     if not re.match(r"^https?://", u or ""):
         raise HTTPException(status_code=400, detail="bad url")
+    if is_terabox_url(u):
+        # Re-resolve the share and stream the fresh dlink (see above).
+        return fetch_terabox(u, f)
     fmt = f or "bv*[height<=720]+ba/b[height<=720]/b"
     tmpdir = "/tmp/dt-fetch"
     os.makedirs(tmpdir, exist_ok=True)

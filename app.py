@@ -19,6 +19,7 @@ hosting quota cannot be abused by strangers. Plan limits (Free/Premium,
 quality caps, watermark rules) are enforced by the website before it calls
 this engine; the engine itself only extracts and delivers.
 """
+import base64
 import os
 import re
 import sys
@@ -33,6 +34,38 @@ import yt_dlp
 
 ENGINE_KEY = os.environ.get("DT_ENGINE_KEY", "")
 MAX_HEIGHT_FREE = 720  # the site passes plan info; kept simple for now
+
+COOKIES_PATH = "/tmp/yt-cookies.txt"
+
+
+def _load_cookies():
+    """Decode the YT_COOKIES_B64 env var (base64 of a Netscape cookies.txt
+    from a spare account) into a local file for yt-dlp. YouTube, Reddit
+    and Vimeo wall off datacenter IPs unless the request carries a signed-
+    in session; the cookies are domain-scoped, so other platforms are
+    unaffected. Absent or invalid value -> no cookiefile at all, and the
+    engine keeps serving every platform exactly as before. The cookie
+    material itself is never printed or logged."""
+    raw = os.environ.get("YT_COOKIES_B64", "").strip()
+    if not raw:
+        return None
+    try:
+        data = base64.b64decode(raw, validate=True)
+        if not data or b"youtube" not in data.lower():
+            raise ValueError("decoded content is not a YouTube cookies file")
+        with open(COOKIES_PATH, "wb") as fh:
+            fh.write(data)
+        os.chmod(COOKIES_PATH, 0o600)
+        print("[cookies] cookiefile loaded for yt-dlp", flush=True)
+        return COOKIES_PATH
+    except Exception as e:
+        print("[cookies] WARNING: YT_COOKIES_B64 unusable "
+              f"({type(e).__name__}); continuing without cookies",
+              flush=True)
+        return None
+
+
+COOKIEFILE = _load_cookies()
 
 app = FastAPI(title="Dahot Tool Engine")
 
@@ -70,6 +103,10 @@ def ydl_opts(extra=None, player_client="KEEP"):
         "socket_timeout": 30,
         "retries": 2,
     }
+    if COOKIEFILE:
+        # Signed-in session for the platforms that wall off datacenter
+        # IPs (YouTube/Reddit/Vimeo). Domain-scoped: no effect elsewhere.
+        opts["cookiefile"] = COOKIEFILE
     if player_client == "KEEP":
         opts["extractor_args"] = {
             # YouTube walls off the default web client from datacenter IPs;
@@ -102,8 +139,8 @@ def is_youtube_url(url: str) -> bool:
     return any(host == h or host.endswith("." + h) for h in YOUTUBE_HOSTS)
 
 
-# Player-client strategies tried in order for YouTube URLs (no cookies are
-# available to this engine): the first strategy whose extraction succeeds
+# Player-client strategies tried in order for YouTube URLs: the first
+# strategy whose extraction succeeds
 # wins; a bot-wall error ("Sign in to confirm you're not a bot") or any
 # other extraction failure falls through to the next strategy. The final
 # entry is the long-standing combo, so YouTube behaviour can only improve

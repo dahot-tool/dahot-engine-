@@ -48,6 +48,17 @@ def _load_cookies():
     material itself is never printed or logged."""
     raw = os.environ.get("YT_COOKIES_B64", "").strip()
     if not raw:
+        # Back4app's .env upload skips very long lines, so the value may
+        # instead arrive split across numbered part variables
+        # (YT_COOKIES_P01, YT_COOKIES_P02, ...); join them in order.
+        parts = []
+        for i in range(1, 65):
+            part = os.environ.get(f"YT_COOKIES_P{i:02d}")
+            if part is None:
+                break
+            parts.append(part.strip())
+        raw = "".join(parts)
+    if not raw:
         return None
     try:
         data = base64.b64decode(raw, validate=True)

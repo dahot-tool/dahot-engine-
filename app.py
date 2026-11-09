@@ -945,24 +945,24 @@ def fetch(u: str, f: str = "", x_dt_key: str = Header(default="")):
                     if os.path.exists(cand):
                         path = cand
                         break
-            return path
+            return path, (info.get("title") or "video")
 
     try:
         if is_youtube_url(u):
             # Download through the same client cycle as /resolve: the
             # client that can see the real formats is the one that can
             # fetch them.
-            path, _label = cycle_youtube(
+            (path, title), _label = cycle_youtube(
                 lambda pc, imp: _download(
                     ydl_opts(extra, player_client=pc, impersonate=imp)))
         else:
-            path = _download(ydl_opts(extra))
+            path, title = _download(ydl_opts(extra))
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=422, detail=str(e)[:300])
     if not os.path.exists(path):
         raise HTTPException(status_code=500, detail="file missing after download")
 
-    filename = safe_name(info.get("title", "video")) + os.path.splitext(path)[1]
+    filename = safe_name(title) + os.path.splitext(path)[1]
     size = os.path.getsize(path)
 
     def stream():

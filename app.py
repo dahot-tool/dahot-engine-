@@ -172,8 +172,13 @@ def is_youtube_url(url: str) -> bool:
 # A share resolved on a mirror host gets its dlinks from that mirror's
 # download host, which can refuse even the impersonated GET while the
 # main host would serve the same file, so /fetch retries exactly once
-# against a fresh resolution forced through www.terabox.com when a
-# mirror-issued dlink is refused with HTTP 403 (see fetch_terabox).
+# when a mirror-issued dlink is refused with HTTP 403: it reuses the
+# sign context captured during the natural resolution and asks only
+# www.terabox.com's sharedownload for a main-host dlink (the main
+# host's shorturlinfo lookup itself is verification-walled from some
+# egresses, so re-running it there is not an option — see
+# fetch_terabox). The retry is a silent detour: if any of its steps
+# fail, the original refusal is what surfaces.
 TERABOX_NDUS = os.environ.get("TERABOX_NDUS", "").strip()
 TERABOX_HOSTS = ("terabox.com", "teraboxapp.com", "1024terabox.com",
                  "1024tera.com", "terabox.app", "mirrobox.com",
@@ -344,6 +349,7 @@ def _tb_list_dir(host: str, surl: str, dir_path: str) -> list:
 # for 120 s — the dlink stays fresh (they live far longer), and a
 # resolve+fetch pair costs TeraBox one lookup sequence, not two.
 _TB_CACHE = {}
+_TB_INFO = {}
 TB_CACHE_TTL = 120
 
 
@@ -360,10 +366,19 @@ def _tb_cache_key(url: str, force_host: str = None) -> str:
         # A forced-host resolution is answered by a different API host
         # and yields dlinks issued by that host's download servers, so
         # it must never share a cache slot with the natural resolution
-        # of the same share — the retry in fetch_terabox depends on
-        # getting the other host's dlink, not the cached mirror one.
+        # of the same share.
         key += "|tbhost=" + force_host
     return key
+
+
+def _tb_sign_context(url: str):
+    """The sign context captured when this share was last resolved
+    naturally — sign/timestamp/shareid/uk/randsk from its shorturlinfo
+    response — or None. /fetch's main-host retry reuses it to ask
+    www.terabox.com's sharedownload for a main-host dlink without
+    re-running the lookup on the main host (see _tb_collect_files,
+    where the context is stored beside the cache entry)."""
+    return _TB_INFO.get(_tb_cache_key(url))
 
 
 def _tb_collect_files(url: str, force_host: str = None):
@@ -374,7 +389,7 @@ def _tb_collect_files(url: str, force_host: str = None):
     With force_host set, every API call goes to that host instead of
     the share's own: the share id is host-independent, and resolving
     through www.terabox.com yields dlinks from the main download host
-    rather than a mirror's (used by the fetch_terabox retry)."""
+    rather than a mirror's."""
     if not TERABOX_NDUS:
         raise HTTPException(status_code=422,
                             detail="terabox: sign-in cookie not configured")
@@ -437,6 +452,12 @@ def _tb_collect_files(url: str, force_host: str = None):
             status_code=422,
             detail="terabox: no downloadable file (dlink empty)")
     _TB_CACHE[key] = (time.monotonic(), files)
+    # Keep the resolution's sign context beside the cache entry, for
+    # /fetch's main-host retry (see _tb_sign_context): only the fields
+    # sharedownload needs, from the shorturlinfo response that this
+    # resolution actually used.
+    _TB_INFO[key] = {k: data.get(k) for k in
+                     ("sign", "timestamp", "shareid", "uk", "randsk")}
     return files
 
 
@@ -596,6 +617,24 @@ def _tb_download(dlink: str, referer: str):
     return resp.headers, uchunks()
 
 
+def _tb_main_host_dlink(url: str, item: dict):
+    """Ask www.terabox.com's sharedownload for a main-host dlink for
+    this file, reusing the sign context captured during the share's
+    natural resolution — no fresh lookup on the main host: its
+    shorturlinfo answers a verification demand (errno 460030) from
+    this egress even while its sharedownload answers, and a
+    d.terabox.com dlink was issued from a reused sign context in the
+    first build's local proof. Returns the dlink, or None when the
+    main host refuses or its answer carries none. Raises only on
+    transport-level failure; the caller treats every outcome alike."""
+    info = _tb_sign_context(url)
+    if not info:
+        return None
+    links = _tb_sharedownload("www.terabox.com", info,
+                              [item.get("fs_id")])
+    return links.get(str(item.get("fs_id")))
+
+
 def fetch_terabox(u: str, f: str):
     """Stream a TeraBox share's file: re-resolve the share so the dlink
     is fresh, then GET it with only the ndus cookie and proxy it through
@@ -605,12 +644,18 @@ def fetch_terabox(u: str, f: str):
     that mirror's download host, and a mirror host can refuse the GET
     with HTTP 403 even through the Chrome-impersonated stack while the
     main host serves the same file (production evidence: the mirror's
-    d.1024terabox.com refused, the first build's d.terabox.com dlink
-    was issued without trouble). So a 403 from any dlink host other
-    than d.terabox.com triggers exactly one fresh resolution forced
-    through www.terabox.com and one retry with its main-host dlink.
-    Any other refusal — and a failed retry — surfaces unchanged, with
-    its own upstream status and host in the detail."""
+    d.1024terabox.com refused with 403). The retry does NOT re-resolve
+    on the main host — www.terabox.com's shorturlinfo answers a
+    verification demand (errno 460030) from this egress — it reuses
+    the sign context captured during the natural resolution, asks only
+    the main host's sharedownload for a main-host dlink, and retries
+    the GET once with it. The detour is silent and never writes to the
+    resolution cache: if ANY of its steps fail (no captured context,
+    sharedownload refusing, an empty dlink, the retry GET refusing),
+    the ORIGINAL mirror refusal surfaces unchanged, with its own
+    upstream status and host in the detail — the retry's internal
+    errors are not the user-facing truth. Any other first refusal
+    (non-403, or already a main-host dlink) also surfaces unchanged."""
     files = _tb_collect_files(u)
     want = (f or "").strip()
     if not want:
@@ -633,8 +678,17 @@ def fetch_terabox(u: str, f: str):
         if (refused.tb_status != 403
                 or _tb_dlink_host(item["dlink"]) == "d.terabox.com"):
             raise
-        item = pick(_tb_collect_files(u, force_host="www.terabox.com"))
-        resp_headers, chunks = _tb_download(item["dlink"], referer)
+        dlink = None
+        try:
+            dlink = _tb_main_host_dlink(u, item)
+        except Exception:
+            dlink = None
+        if not dlink:
+            raise refused
+        try:
+            resp_headers, chunks = _tb_download(dlink, referer)
+        except Exception:
+            raise refused
     name = item.get("server_filename") or "terabox-file"
     ext = _tb_file_ext(item)
     stem = name.rsplit(".", 1)[0] if "." in name else name

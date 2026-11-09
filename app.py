@@ -80,6 +80,19 @@ def _load_cookies():
 
 COOKIEFILE = _load_cookies()
 
+# PO-token provider (bgutil-ytdlp-pot-provider 2.0.2, plugin + server in
+# lockstep). In production the server runs as a sidecar INSIDE this
+# container on loopback (see space/pot/ and space/start.sh), so the
+# default points there and tokens are minted from the same egress as the
+# downloads themselves. POT_PROVIDER_URL="" disables the provider (the
+# engine then behaves exactly as before); a full URL points at an
+# external provider instead. The URL is not a secret, but per the
+# integration note it is never published on the site.
+POT_PROVIDER_URL = os.environ.get(
+    "POT_PROVIDER_URL", "http://127.0.0.1:4416").strip()
+print(f"[pot] PO-token provider: {POT_PROVIDER_URL or 'disabled'}",
+      flush=True)
+
 app = FastAPI(title="Dahot Tool Engine")
 
 
@@ -132,6 +145,17 @@ def ydl_opts(extra=None, player_client="KEEP", impersonate=True):
     elif player_client is not None:
         opts["extractor_args"] = {
             "youtube": {"player_client": list(player_client)},
+        }
+    if POT_PROVIDER_URL:
+        # bgutil PO-token provider, merged AFTER the player_client
+        # branches so every strategy in YT_CLIENT_STRATEGIES gets it
+        # (including the default, None, branch, which sets no
+        # extractor_args of its own). The plugin pings base_url itself
+        # and bypasses proxies for provider calls; when the provider is
+        # unreachable it simply reports itself unavailable and yt-dlp
+        # proceeds without a token, as before.
+        opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
+            "base_url": [POT_PROVIDER_URL],
         }
     if impersonate:
         try:

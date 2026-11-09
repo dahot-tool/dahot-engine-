@@ -165,7 +165,10 @@ def is_youtube_url(url: str) -> bool:
 # (its own dlink field comes back empty) followed by sharedownload,
 # which exchanges the share's sign/timestamp + the file ids for the real
 # dlinks. dlinks are short-lived, so /fetch re-resolves the share at
-# download time and never stores or hands out a dlink.
+# download time and never stores or hands out a dlink. The dlink GET
+# itself goes through _tb_download: the download hosts refuse plain
+# urllib's TLS fingerprint, so it uses curl_cffi's Chrome
+# impersonation (urllib as fallback) with the ndus-only cookie.
 TERABOX_NDUS = os.environ.get("TERABOX_NDUS", "").strip()
 TERABOX_HOSTS = ("terabox.com", "teraboxapp.com", "1024terabox.com",
                  "1024tera.com", "terabox.app", "mirrobox.com",
@@ -217,14 +220,23 @@ def _tb_api_host(url: str) -> str:
 
 
 class _TbRedirect(urllib.request.HTTPRedirectHandler):
-    """Keep the session ndus-only on every redirect hop (dlink hosts)."""
+    """Keep the session ndus-only on every redirect hop (dlink hosts):
+    the original request's headers (User-Agent, Referer) carry over,
+    and the Cookie is re-attached as ndus and nothing else."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        keep = {}
+        for k, v in req.headers.items():
+            if k.lower() in ("cookie", "host", "content-length",
+                             "content-type"):
+                continue
+            keep[k] = v
+        keep["Cookie"] = "ndus=" + TERABOX_NDUS
+        if not any(k.lower() == "user-agent" for k in keep):
+            keep["User-Agent"] = TB_UA
         return urllib.request.Request(
             newurl,
-            headers={"User-Agent": TB_UA,
-                     "Cookie": "ndus=" + TERABOX_NDUS,
-                     "Referer": "https://www.terabox.com/"},
+            headers=keep,
             origin_req_host=req.origin_req_host,
             unverifiable=True,
         )
@@ -457,6 +469,104 @@ def resolve_terabox(url: str) -> dict:
     }
 
 
+def _tb_dlink_host(dlink: str) -> str:
+    """Host of a dlink, for error messages: enough to name which
+    TeraBox download host refused, without ever exposing the signed
+    dlink itself (or any cookie value)."""
+    try:
+        return urllib.parse.urlparse(dlink).netloc.lower().split(":")[0] or "?"
+    except Exception:
+        return "?"
+
+
+def _tb_download(dlink: str, referer: str):
+    """Open a dlink for streaming. Returns (headers, chunk iterator).
+
+    The API hosts accept plain urllib, but the download hosts refuse
+    its stock Python TLS fingerprint even with the right cookie and
+    Referer (an HTTP error, not a redirect or a timeout), so the GET
+    goes through curl_cffi with Chrome impersonation when available
+    — libcurl also re-sends the ndus-only Cookie and the Referer on
+    every redirect hop toward the CDN, matching the browser. The
+    plain-urllib path stays as fallback. Either way, a refusal raises
+    an HTTPException naming the upstream status and the dlink's host
+    — "download refused (HTTP 403 from d.terabox.com)" — so a
+    production failure says which wall it hit (fingerprint block vs
+    expired link) instead of a bare, useless "HTTPError"."""
+    host = _tb_dlink_host(dlink)
+    headers = {
+        "User-Agent": TB_UA,
+        "Cookie": "ndus=" + TERABOX_NDUS,
+        "Referer": referer,
+        "Accept": "*/*",
+    }
+    try:
+        from curl_cffi import requests as creq
+    except Exception:
+        creq = None
+    creq_error = None
+    if creq is not None:
+        try:
+            resp = creq.get(dlink, headers=headers, impersonate="chrome",
+                            stream=True, timeout=60, allow_redirects=True)
+        except Exception as e:
+            # Transport-level failure of the impersonated stack: fall
+            # through to plain urllib before giving up, so the two
+            # stacks' different fates stay visible in the final error.
+            creq_error = type(e).__name__
+            resp = None
+        if resp is not None:
+            if resp.status_code != 200:
+                status = resp.status_code
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"terabox: download refused "
+                           f"(HTTP {status} from {host})")
+
+            def chunks():
+                try:
+                    for part in resp.iter_content(chunk_size=1024 * 256):
+                        if part:
+                            yield part
+                finally:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+
+            return resp.headers, chunks()
+    req = urllib.request.Request(dlink, headers=headers)
+    try:
+        resp = _tb_open(req)
+    except urllib.error.HTTPError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"terabox: download refused (HTTP {e.code} from {host})")
+    except Exception as e:
+        extra = (f"; impersonated attempt also failed ({creq_error})"
+                 if creq_error else "")
+        raise HTTPException(
+            status_code=502,
+            detail=f"terabox: download failed "
+                   f"({type(e).__name__} via {host}){extra}")
+
+    def uchunks():
+        try:
+            while True:
+                part = resp.read(1024 * 256)
+                if not part:
+                    break
+                yield part
+        finally:
+            resp.close()
+
+    return resp.headers, uchunks()
+
+
 def fetch_terabox(u: str, f: str):
     """Stream a TeraBox share's file: re-resolve the share so the dlink
     is fresh, then GET it with only the ndus cookie and proxy it through
@@ -467,17 +577,12 @@ def fetch_terabox(u: str, f: str):
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
         want = (qs.get("dtfid") or [""])[0]
     item = next((c for c in files if str(c.get("fs_id")) == want), files[0])
-    req = urllib.request.Request(item["dlink"], headers={
-        "User-Agent": TB_UA,
-        "Cookie": "ndus=" + TERABOX_NDUS,
-        "Referer": "https://www.terabox.com/",
-    })
-    try:
-        resp = _tb_open(req)
-    except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"terabox: download failed ({type(e).__name__})")
+    # A browser reaches the dlink by navigating away from the share
+    # page, so the share URL itself is the honest Referer; a caller
+    # URL that is somehow not a TeraBox page falls back to the main
+    # site root.
+    referer = u if is_terabox_url(u) else "https://www.terabox.com/"
+    resp_headers, chunks = _tb_download(item["dlink"], referer)
     name = item.get("server_filename") or "terabox-file"
     ext = _tb_file_ext(item)
     stem = name.rsplit(".", 1)[0] if "." in name else name
@@ -486,22 +591,11 @@ def fetch_terabox(u: str, f: str):
         "Content-Disposition": "attachment; filename*=UTF-8''"
                                + urllib.parse.quote(filename),
     }
-    length = resp.headers.get("Content-Length")
+    length = resp_headers.get("Content-Length")
     if length:
         headers["Content-Length"] = length
-    ctype = resp.headers.get("Content-Type") or "application/octet-stream"
-
-    def stream():
-        try:
-            while True:
-                chunk = resp.read(1024 * 256)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            resp.close()
-
-    return StreamingResponse(stream(), media_type=ctype, headers=headers)
+    ctype = resp_headers.get("Content-Type") or "application/octet-stream"
+    return StreamingResponse(chunks, media_type=ctype, headers=headers)
 
 
 # Player-client strategies tried in order for YouTube URLs, as

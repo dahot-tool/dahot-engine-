@@ -1309,13 +1309,32 @@ def _stamp_watermark(path):
                 f"box=1:boxcolor=0x0B5563@0.40:boxborderw=7:"
                 f"x=w-tw-12:y=h-th-12")
         out = path[:-4] + ".wm.mp4"
-        proc = subprocess.run(
+        # HARD DEADLINE: the main engine's host kills any request at
+        # ~90 s (proven 2026-11-10: a 720p stamp encode on the free
+        # 0.25-CPU container ran past it and the download died with a
+        # 504). The stamp gets ~50 s; if ffmpeg is not done by then it
+        # is killed and the ORIGINAL file is served — a download must
+        # never fail because of a watermark.
+        proc = subprocess.Popen(
             ["ffmpeg", "-y", "-i", path, "-vf", draw,
              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
              "-maxrate", "2000k", "-bufsize", "4000k",
              "-c:a", "copy", "-movflags", "+faststart", out],
-            capture_output=True, timeout=280)
-        if proc.returncode == 0 and os.path.exists(out) \
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            rc = proc.wait(timeout=50)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+            return path
+        if rc == 0 and os.path.exists(out) \
                 and os.path.getsize(out) > 0:
             try:
                 os.remove(path)

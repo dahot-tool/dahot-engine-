@@ -927,10 +927,13 @@ def resolve_invidious(url):
     # its honest download size is video + audio. Without this the site
     # understated the real file (observed live 2026-11-10: the 360p row
     # showed 15.1 MB while the delivered merged file was 28.8 MB).
-    audio_sizes = [f["size"] for f in formats
-                   if f["has_audio"] and not f["height"] and f["size"]]
-    if audio_sizes:
-        best_audio = max(audio_sizes)
+    audio_entries = [f for f in formats
+                     if f["has_audio"] and not f["height"] and f["size"]]
+    if audio_entries:
+        # Mirror fetch_invidious's audio choice: m4a first, then size.
+        audio_entries.sort(key=lambda f: (f["ext"] == "m4a", f["size"]),
+                           reverse=True)
+        best_audio = audio_entries[0]["size"]
         for f in formats:
             if not f["has_audio"] and f["size"]:
                 f["size"] = f["size"] + best_audio

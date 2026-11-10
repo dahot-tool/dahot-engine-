@@ -923,6 +923,17 @@ def resolve_invidious(url):
     formats.sort(key=lambda x: (x["height"] or 0))
     if not formats:
         raise yt_dlp.utils.DownloadError("invidious: no usable formats")
+    # A video-only format is delivered merged with the best audio, so
+    # its honest download size is video + audio. Without this the site
+    # understated the real file (observed live 2026-11-10: the 360p row
+    # showed 15.1 MB while the delivered merged file was 28.8 MB).
+    audio_sizes = [f["size"] for f in formats
+                   if f["has_audio"] and not f["height"] and f["size"]]
+    if audio_sizes:
+        best_audio = max(audio_sizes)
+        for f in formats:
+            if not f["has_audio"] and f["size"]:
+                f["size"] = f["size"] + best_audio
     thumb = None
     thumbs = data.get("videoThumbnails") or []
     if thumbs:

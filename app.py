@@ -1042,7 +1042,7 @@ def _inv_download(url, dest):
         detail="invidious media refused: " + " | ".join(attempts)[:600])
 
 
-def fetch_invidious(u, f):
+def fetch_invidious(u, f, wm=""):
     """Deliver an "inv:<itag>" format: muxed streams and audio download
     directly through the instance proxy; a video-only pick is paired
     with the best audio track and muxed with ffmpeg -c copy."""
@@ -1119,6 +1119,8 @@ def fetch_invidious(u, f):
         raise HTTPException(status_code=502,
                             detail="invidious download failed: "
                             + str(e)[:150])
+    if wm == "1" and media.startswith("video/") and out_ext == "mp4":
+        path = _stamp_watermark(path)
     filename = safe_name(title) + "." + out_ext
     size = os.path.getsize(path)
 
@@ -1277,8 +1279,57 @@ def resolve(payload: dict, x_dt_key: str = Header(default="")):
     return result
 
 
+def _stamp_watermark(path):
+    """Burn the 'Dahot Tool' brand watermark into a short MP4 — the
+    Free-plan brand mark (added 2026-11-10). SAFETY-FIRST: returns the
+    ORIGINAL path on any problem (not an MP4, duration unknown or over
+    the 4-minute cap, no usable font, ffmpeg error or timeout) — a
+    watermark must never break or long-delay a download. The caller
+    passes wm=1 only for Free-plan fetches (decided server-side in the
+    engine-proxy from the caller's real plan)."""
+    import subprocess
+    try:
+        if not path.lower().endswith(".mp4"):
+            return path
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, timeout=30)
+        dur = float((probe.stdout or b"").decode().strip() or 0)
+        if not dur or dur > 240:
+            return path
+        font = ""
+        for cand in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"):
+            if os.path.exists(cand):
+                font = f"fontfile={cand}:"
+                break
+        draw = (f"drawtext={font}text='Dahot Tool':fontcolor=white:"
+                f"fontsize=h/34:borderw=1:bordercolor=black@0.3:"
+                f"box=1:boxcolor=0x0B5563@0.40:boxborderw=7:"
+                f"x=w-tw-12:y=h-th-12")
+        out = path[:-4] + ".wm.mp4"
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", path, "-vf", draw,
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
+             "-maxrate", "2000k", "-bufsize", "4000k",
+             "-c:a", "copy", "-movflags", "+faststart", out],
+            capture_output=True, timeout=280)
+        if proc.returncode == 0 and os.path.exists(out) \
+                and os.path.getsize(out) > 0:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return out
+    except Exception:
+        pass
+    return path
+
+
 @app.get("/fetch")
-def fetch(u: str, f: str = "", x_dt_key: str = Header(default="")):
+def fetch(u: str, f: str = "", wm: str = "",
+          x_dt_key: str = Header(default="")):
     check_key(x_dt_key)
     if not re.match(r"^https?://", u or ""):
         raise HTTPException(status_code=400, detail="bad url")
@@ -1287,7 +1338,7 @@ def fetch(u: str, f: str = "", x_dt_key: str = Header(default="")):
         return fetch_terabox(u, f)
     if is_youtube_url(u) and f.startswith("inv:"):
         # Format ids minted by the Invidious /resolve fallback.
-        return fetch_invidious(u, f)
+        return fetch_invidious(u, f, wm)
     if f:
         # A bare format id from /resolve can be a video-only track
         # (Reddit/DASH and YouTube adaptive formats): try it merged
@@ -1350,6 +1401,8 @@ def fetch(u: str, f: str = "", x_dt_key: str = Header(default="")):
     if not os.path.exists(path):
         raise HTTPException(status_code=500, detail="file missing after download")
 
+    if wm == "1":
+        path = _stamp_watermark(path)
     filename = safe_name(title) + os.path.splitext(path)[1]
     size = os.path.getsize(path)
 

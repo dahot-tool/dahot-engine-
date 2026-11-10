@@ -1120,7 +1120,7 @@ def fetch_invidious(u, f, wm=""):
                             detail="invidious download failed: "
                             + str(e)[:150])
     if wm == "1" and media.startswith("video/") and out_ext == "mp4":
-        path = _stamp_watermark(path)
+        path = _stamp_watermark(path, data.get("lengthSeconds"))
     filename = safe_name(title) + "." + out_ext
     size = os.path.getsize(path)
 
@@ -1279,24 +1279,60 @@ def resolve(payload: dict, x_dt_key: str = Header(default="")):
     return result
 
 
-def _stamp_watermark(path):
+def _stamp_watermark(path, known_duration=None):
     """Burn the 'Dahot Tool' brand watermark into a short MP4 — the
     Free-plan brand mark (added 2026-11-10). SAFETY-FIRST: returns the
     ORIGINAL path on any problem (not an MP4, duration unknown or over
     the 4-minute cap, no usable font, ffmpeg error or timeout) — a
     watermark must never break or long-delay a download. The caller
     passes wm=1 only for Free-plan fetches (decided server-side in the
-    engine-proxy from the caller's real plan)."""
+    engine-proxy from the caller's real plan).
+
+    SPEED GATE (2026-11-10, measured locally under a 0.25-CPU duty
+    throttle): a 720p ultrafast/CRF32 stamp encode needs ~1 wall-second
+    per video-second AT BEST on a quarter core, and the main engine's
+    host kills any request at ~90 s — so the old flat 50 s deadline
+    still let download + probe + a doomed encode stack past 90 s and
+    the download died with a 504. Now the stamp is only ATTEMPTED when
+    the duration (passed in by the caller from resolve metadata, so no
+    ffprobe is needed) says the encode can plausibly finish inside a
+    small budget: duration x DT_WM_RATE (planning wall-seconds per
+    video-second, default 1.5) must fit DT_WM_BUDGET_S (default 25 s),
+    which is also the encode's hard kill deadline. Anything longer
+    returns the ORIGINAL immediately — zero added delay, never a 504.
+    On a stronger host (e.g. the Railway YouTube engine) both knobs can
+    be raised via env to admit longer videos."""
     import subprocess
+    budget = 25.0
+    rate = 1.5
+    try:
+        budget = float(os.environ.get("DT_WM_BUDGET_S", "25") or 25)
+        rate = float(os.environ.get("DT_WM_RATE", "1.5") or 1.5)
+    except Exception:
+        pass
     try:
         if not path.lower().endswith(".mp4"):
             return path
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", path],
-            capture_output=True, timeout=30)
-        dur = float((probe.stdout or b"").decode().strip() or 0)
+        dur = 0.0
+        if known_duration:
+            try:
+                dur = float(known_duration)
+            except Exception:
+                dur = 0.0
+        if not dur:
+            # Fallback only: probe the local file (measured ~0.1 s;
+            # the old 30 s timeout was pure worst-case stack-up).
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "format=duration", "-of", "csv=p=0", path],
+                capture_output=True, timeout=8)
+            dur = float((probe.stdout or b"").decode().strip() or 0)
         if not dur or dur > 240:
+            return path
+        if dur * rate > budget:
+            # The encode cannot finish inside the budget on this
+            # class of host — serve the original NOW instead of
+            # burning the whole deadline and risking a 504.
             return path
         font = ""
         for cand in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -1309,24 +1345,24 @@ def _stamp_watermark(path):
                 f"box=1:boxcolor=0x0B5563@0.40:boxborderw=7:"
                 f"x=w-tw-12:y=h-th-12")
         out = path[:-4] + ".wm.mp4"
-        # HARD DEADLINE: the main engine's host kills any request at
-        # ~90 s (proven 2026-11-10: a 720p stamp encode on the free
-        # 0.25-CPU container ran past it and the download died with a
-        # 504). The stamp gets ~50 s; if ffmpeg is not done by then it
-        # is killed and the ORIGINAL file is served — a download must
-        # never fail because of a watermark.
+        # HARD DEADLINE = the same budget the gate planned against;
+        # if ffmpeg is not done by then it is killed and the ORIGINAL
+        # file is served — a download must never fail, or wait the
+        # full budget plus a slow download, because of a watermark.
+        # (No +faststart: it costs a second full read+write pass over
+        # the output and a download attachment does not need it.)
         proc = subprocess.Popen(
             ["ffmpeg", "-y", "-i", path, "-vf", draw,
              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
              "-maxrate", "2000k", "-bufsize", "4000k",
-             "-c:a", "copy", "-movflags", "+faststart", out],
+             "-c:a", "copy", out],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            rc = proc.wait(timeout=50)
+            rc = proc.wait(timeout=budget)
         except subprocess.TimeoutExpired:
             proc.kill()
             try:
-                proc.wait(timeout=10)
+                proc.wait(timeout=3)
             except Exception:
                 pass
             try:
@@ -1403,25 +1439,25 @@ def fetch(u: str, f: str = "", wm: str = "",
                 ]
                 if cands:
                     path = max(cands, key=lambda c: os.path.getmtime(c))
-            return path, (info.get("title") or "video")
+            return path, (info.get("title") or "video"), info.get("duration")
 
     try:
         if is_youtube_url(u):
             # Download through the same client cycle as /resolve: the
             # client that can see the real formats is the one that can
             # fetch them.
-            (path, title), _label = cycle_youtube(
+            (path, title, dur_s), _label = cycle_youtube(
                 lambda pc, imp: _download(
                     ydl_opts(extra, player_client=pc, impersonate=imp)))
         else:
-            path, title = _download(ydl_opts(extra))
+            path, title, dur_s = _download(ydl_opts(extra))
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=422, detail=str(e)[:300])
     if not os.path.exists(path):
         raise HTTPException(status_code=500, detail="file missing after download")
 
     if wm == "1":
-        path = _stamp_watermark(path)
+        path = _stamp_watermark(path, dur_s)
     filename = safe_name(title) + os.path.splitext(path)[1]
     size = os.path.getsize(path)
 

@@ -1255,7 +1255,15 @@ def fetch(u: str, f: str = "", x_dt_key: str = Header(default="")):
     if is_youtube_url(u) and f.startswith("inv:"):
         # Format ids minted by the Invidious /resolve fallback.
         return fetch_invidious(u, f)
-    fmt = f or "bv*[height<=720]+ba/b[height<=720]/b"
+    if f:
+        # A bare format id from /resolve can be a video-only track
+        # (Reddit/DASH and YouTube adaptive formats): try it merged
+        # with the best audio first, fall back to the bare id — the
+        # bare id alone would deliver a silent file (proven with a
+        # native Reddit video, 2026-11-10).
+        fmt = f"{f}+ba/{f}"
+    else:
+        fmt = "bv*[height<=720]+ba/b[height<=720]/b"
     tmpdir = "/tmp/dt-fetch"
     os.makedirs(tmpdir, exist_ok=True)
     extra = {

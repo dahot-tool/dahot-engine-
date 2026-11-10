@@ -13,6 +13,10 @@ A small HTTP service around yt-dlp:
                                   browser saves it into the device Downloads
                                   folder (CDN links are IP-bound, so handing
                                   them to the browser directly would fail).
+  POST /genvideo {"prompt":...} / POST /genmusic {"prompt":..., "duration":s}
+                               -> {"job": id}: AI generation on public HF
+                                  Spaces; poll GET /genjob/<id> -> working /
+                                  error JSON, or the finished file itself.
 
 Access is gated by the shared header X-DT-Key (env DT_ENGINE_KEY) so the free
 hosting quota cannot be abused by strangers. Plan limits (Free/Premium,
@@ -1797,6 +1801,371 @@ def tts(payload: dict, x_dt_key: str = Header(default="")):
         raise HTTPException(502, "Voice service returned no audio.")
     return Response(content=audio, media_type="audio/mpeg", headers={
         "Content-Disposition": 'attachment; filename="dahot-voiceover.mp3"'})
+
+
+# ---------------------------------------------------------------------------
+# AI Video / AI Music generators.
+#
+# Both tools run on public Hugging Face Spaces via the anonymous Gradio
+# queue API (no key, no account, no card — the same class of route as the
+# AI Picture tool): AI Video = Lightricks LTX-Video distilled, AI Music =
+# ACE-Step v1. Routes were proven with real output files 2026-11-10 (see
+# hidden_files/ai-gen-routes-research-2026-11-10.md). A generation can sit
+# in the Space's GPU queue far longer than this host's ~90 s request
+# limit, so generation is a JOB, never one long request:
+#   POST /genvideo {"prompt": ...}            -> {"job": id} at once
+#   POST /genmusic {"prompt": ..., "duration": seconds?}
+#   GET  /genjob/<id>  -> {"state": "working"} while the job runs,
+#                         {"state": "error", "detail": ...} on failure,
+#                         or the finished FILE ITSELF (200 + attachment)
+#                         once done.
+# A failed generation never produces a fake file; the site shows the
+# honest detail and does not consume the user's free try.
+# ---------------------------------------------------------------------------
+import json as _json
+import threading as _threading
+import uuid as _uuid
+
+GEN_DIR = "/tmp/dt-genjobs"
+GEN_MAX_ACTIVE = 2      # concurrent jobs; the anonymous GPU budget is thin
+GEN_KEEP_RESULTS = 10   # newest finished job files kept for pollers
+GEN_JOB_TTL = 15 * 60   # seconds before a job (and its file) is dropped
+
+LTX_SPACE = "https://lightricks-ltx-video-distilled.hf.space"
+LTX_FN_INDEX = 4        # config dependency index of api_name "text_to_video"
+ACE_SPACE = "https://ace-step-ace-step.hf.space"
+ACE_FN_INDEX = 11       # config dependency index of api_name "__call__"
+
+_gen_jobs = {}          # id -> {kind, state, created, path, media, filename, detail}
+_gen_lock = _threading.Lock()
+
+try:
+    os.makedirs(GEN_DIR, exist_ok=True)
+except Exception:
+    pass
+
+
+class _GenFail(Exception):
+    """A generation failure with a short, honest, caller-safe detail.
+    transient=True marks transport-level trouble (worth ONE retry)."""
+
+    def __init__(self, detail, transient=False):
+        super().__init__(detail)
+        self.detail = detail
+        self.transient = transient
+
+
+def _gen_housekeeping_locked():
+    """Drop expired jobs/files and cap kept results. Caller holds the lock."""
+    now = time.time()
+    for job_id in list(_gen_jobs):
+        job = _gen_jobs[job_id]
+        if now - job["created"] > GEN_JOB_TTL:
+            if job.get("path"):
+                try:
+                    os.remove(job["path"])
+                except Exception:
+                    pass
+            del _gen_jobs[job_id]
+    done = sorted((j for j in _gen_jobs.values() if j["state"] == "done"),
+                  key=lambda j: j["created"])
+    for job in done[:-GEN_KEEP_RESULTS] if len(done) > GEN_KEEP_RESULTS else []:
+        if job.get("path"):
+            try:
+                os.remove(job["path"])
+            except Exception:
+                pass
+        _gen_jobs.pop(job["id"], None)
+    # Sweep orphaned files (e.g. a job removed while its worker was writing).
+    try:
+        live = {j.get("path") for j in _gen_jobs.values()}
+        for name in os.listdir(GEN_DIR):
+            path = os.path.join(GEN_DIR, name)
+            if path not in live and now - os.path.getmtime(path) > GEN_JOB_TTL:
+                os.remove(path)
+    except Exception:
+        pass
+
+
+def _gen_extract_file_url(space, output):
+    """Pull the result file URL out of a completed Gradio output. The
+    file can sit directly in data[0] (ACE-Step: a FileData dict) or
+    nested one level down (LTX: data[0] is {"video": FileData,
+    "subtitles": ...}), so search recursively — the same walk the
+    research's working test script used."""
+
+    def find(node):
+        if isinstance(node, dict):
+            if node.get("url"):
+                return node["url"]
+            if node.get("path"):
+                return space + "/gradio_api/file=" + node["path"]
+            for value in node.values():
+                hit = find(value)
+                if hit:
+                    return hit
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                hit = find(value)
+                if hit:
+                    return hit
+        elif isinstance(node, str) and node.startswith("http"):
+            return node
+        return None
+
+    return find((output or {}).get("data"))
+
+
+def _gen_error_detail(err_text):
+    """Map a Space-side error to a short honest detail. Returns
+    (detail, transient)."""
+    low = (err_text or "").lower()
+    if "quota" in low or "zerogpu" in low:
+        return ("The free generation service is busy right now — "
+                "please try again later."), False
+    return "The generation failed on the service side. Please try again.", False
+
+
+def _hf_sse_once(space, session_hash, deadline):
+    """One SSE pass over the Gradio queue/data stream. Returns the result
+    file URL on completion, None when the stream ends/drops without a
+    terminal message (the caller reconnects), and raises _GenFail for
+    failures the service itself reported."""
+    url = space + "/gradio_api/queue/data?session_hash=" + session_hash
+    req = urllib.request.Request(url, headers={"User-Agent": TB_UA})
+    try:
+        resp = urllib.request.urlopen(
+            req, timeout=max(5.0, min(45.0, deadline - time.time())))
+    except Exception:
+        return None
+    with resp:
+        while True:
+            if time.time() >= deadline:
+                raise _GenFail(
+                    "The generation took too long and was stopped. "
+                    "Please try again.")
+            try:
+                line = resp.readline()
+            except Exception:
+                return None
+            if not line:
+                return None
+            line = line.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                msg = _json.loads(line[5:].strip())
+            except Exception:
+                continue
+            kind = msg.get("msg") or ""
+            if kind == "process_completed":
+                output = msg.get("output") or {}
+                err = output.get("error") or msg.get("error")
+                if err or msg.get("success") is False:
+                    detail, transient = _gen_error_detail(str(err or ""))
+                    raise _GenFail(detail, transient=transient)
+                file_url = _gen_extract_file_url(space, output)
+                if not file_url:
+                    raise _GenFail(
+                        "The generation finished without a file. "
+                        "Please try again.")
+                return file_url
+            if kind in ("process_error", "error"):
+                detail, transient = _gen_error_detail(
+                    str(msg.get("error") or ""))
+                raise _GenFail(detail, transient=transient)
+            # estimation / process_starts / process_generating / heartbeat:
+            # keep waiting.
+
+
+def _hf_queue_file_url(space, fn_index, data, deadline):
+    """queue/join -> SSE wait -> result file URL (the raw-HTTP pattern
+    proven in the 2026-11-10 research; gradio_client's long-poll is not
+    used because it dies on some egress proxies)."""
+    session_hash = _uuid.uuid4().hex[:12]
+    body = _json.dumps({"data": data, "fn_index": fn_index,
+                        "session_hash": session_hash}).encode("utf-8")
+    req = urllib.request.Request(
+        space + "/gradio_api/queue/join", data=body, method="POST",
+        headers={"User-Agent": TB_UA, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            join = _json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        raise _GenFail("The generation service could not be reached. "
+                       "Please try again.", transient=True)
+    if not join.get("event_id"):
+        raise _GenFail("The free generation service is busy right now — "
+                       "please try again later.", transient=True)
+    reconnects = 0
+    while True:
+        if time.time() >= deadline:
+            raise _GenFail("The generation took too long and was stopped. "
+                           "Please try again.")
+        file_url = _hf_sse_once(space, session_hash, deadline)
+        if file_url:
+            return file_url
+        reconnects += 1
+        if reconnects > 12:
+            raise _GenFail("The generation service could not be reached. "
+                           "Please try again.", transient=True)
+        time.sleep(2)
+
+
+def _gen_download(job_id, kind, file_url, deadline):
+    """Download the finished file into GEN_DIR. Returns
+    (path, media_type, filename)."""
+    exts = (".mp4", ".webm", ".mov") if kind == "video" else \
+        (".mp3", ".wav", ".flac", ".ogg")
+    ext = os.path.splitext(urllib.parse.urlparse(file_url).path)[1].lower()
+    if ext not in exts:
+        ext = exts[0]
+    media = {"video": {".mp4": "video/mp4", ".webm": "video/webm",
+                       ".mov": "video/quicktime"},
+             "music": {".mp3": "audio/mpeg", ".wav": "audio/wav",
+                       ".flac": "audio/flac", ".ogg": "audio/ogg"}}[kind][ext]
+    fname = ("dahot-ai-video" if kind == "video" else "dahot-ai-music") + ext
+    path = os.path.join(GEN_DIR, job_id + ext)
+    req = urllib.request.Request(file_url, headers={"User-Agent": TB_UA})
+    try:
+        with urllib.request.urlopen(
+                req, timeout=max(10.0, min(60.0, deadline - time.time()))) as resp, \
+                open(path, "wb") as fh:
+            while True:
+                block = resp.read(256 * 1024)
+                if not block:
+                    break
+                fh.write(block)
+    except Exception:
+        raise _GenFail("The generated file could not be downloaded. "
+                       "Please try again.", transient=True)
+    if not os.path.exists(path) or os.path.getsize(path) < 1024:
+        raise _GenFail("The generation returned an empty file. "
+                       "Please try again.", transient=True)
+    return path, media, fname
+
+
+def _gen_worker(job_id, kind, space, fn_index, data, timeout_s):
+    deadline = time.time() + timeout_s
+    detail = "The generation failed. Please try again."
+    for _attempt in (1, 2):     # one automatic retry, transient failures only
+        try:
+            file_url = _hf_queue_file_url(space, fn_index, data, deadline)
+            path, media, fname = _gen_download(job_id, kind, file_url, deadline)
+            with _gen_lock:
+                job = _gen_jobs.get(job_id)
+                if job:
+                    job.update(state="done", path=path, media=media,
+                               filename=fname)
+            return
+        except _GenFail as e:
+            detail = e.detail
+            if not e.transient:
+                break
+        except Exception:
+            detail = ("The generation service could not be reached. "
+                      "Please try again.")
+        if time.time() >= deadline:
+            break
+        time.sleep(2)
+    with _gen_lock:
+        job = _gen_jobs.get(job_id)
+        if job:
+            job.update(state="error", detail=detail)
+
+
+def _gen_start(kind, space, fn_index, data, timeout_s):
+    with _gen_lock:
+        _gen_housekeeping_locked()
+        active = sum(1 for j in _gen_jobs.values() if j["state"] == "working")
+        if active >= GEN_MAX_ACTIVE:
+            raise HTTPException(
+                503, "The generation service is busy right now — "
+                     "please try again in a moment.")
+        job_id = _uuid.uuid4().hex[:16]
+        _gen_jobs[job_id] = {"id": job_id, "kind": kind, "state": "working",
+                             "created": time.time(), "path": None,
+                             "media": None, "filename": None, "detail": None}
+    _threading.Thread(target=_gen_worker,
+                      args=(job_id, kind, space, fn_index, data, timeout_s),
+                      daemon=True).start()
+    return {"job": job_id}
+
+
+@app.post("/genvideo")
+def genvideo(payload: dict, x_dt_key: str = Header(default="")):
+    """AI Video Generator: text prompt -> short MP4 (LTX-Video distilled
+    on a public HF Space). Job pattern: returns {"job": id} immediately;
+    poll /genjob/<id> for the file."""
+    check_key(x_dt_key)
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(400, "No prompt given.")
+    prompt = prompt[:500]
+    # Parameter order/defaults exactly as proven in the 2026-11-10 tests
+    # (only the prompt is ours): prompt, negative prompt, -, -, height,
+    # width, mode, duration s, -, seed, -, -, -.
+    data = [prompt,
+            "worst quality, inconsistent motion, blurry, jittery, distorted",
+            None, None, 512, 704, "text-to-video", 2, 9, 42, True, 1, True]
+    return _gen_start("video", LTX_SPACE, LTX_FN_INDEX, data, 240)
+
+
+@app.post("/genmusic")
+def genmusic(payload: dict, x_dt_key: str = Header(default="")):
+    """AI Music Generator: style prompt -> MP3 (ACE-Step v1 on a public
+    HF Space). Job pattern: returns {"job": id} immediately; poll
+    /genjob/<id> for the file."""
+    check_key(x_dt_key)
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(400, "No prompt given.")
+    prompt = prompt[:300]
+    try:
+        duration = int(payload.get("duration") or 20)
+    except Exception:
+        duration = 20
+    duration = max(10, min(duration, 60))
+    # Parameter order/defaults exactly as proven in the 2026-11-10 tests:
+    # duration, tags (our prompt), lyrics [instrumental], steps, guidance,
+    # scheduler, cfg type, omega, seeds, then the demo's fixed defaults.
+    data = [duration, prompt, "[instrumental]", 30, 15.0, "euler", "apg",
+            10.0, None, 0.5, 0.0, 3.0, True, False, True, None, 0.0, 0.0,
+            False, 0.5, None, "none"]
+    return _gen_start("music", ACE_SPACE, ACE_FN_INDEX, data, 180)
+
+
+@app.get("/genjob/{job_id}")
+def genjob(job_id: str, x_dt_key: str = Header(default="")):
+    """Poll an AI generation job: {"state": "working"} while it runs,
+    {"state": "error", "detail": ...} on failure, or the finished file
+    itself (200 + attachment) once done."""
+    check_key(x_dt_key)
+    with _gen_lock:
+        _gen_housekeeping_locked()
+        job = _gen_jobs.get(job_id)
+        if not job:
+            return JSONResponse(status_code=404,
+                                content={"error": "unknown job"})
+        state = job["state"]
+        detail = job.get("detail")
+        path, media, fname = job.get("path"), job.get("media"), job.get("filename")
+    if state == "working":
+        return {"state": "working"}
+    if state == "error":
+        return {"state": "error",
+                "detail": detail or "The generation failed. Please try again."}
+    try:
+        with open(path, "rb") as fh:
+            content = fh.read()
+    except Exception:
+        return JSONResponse(
+            status_code=410,
+            content={"state": "error",
+                     "detail": "The generated file has expired. "
+                               "Please generate again."})
+    return Response(content=content, media_type=media, headers={
+        "Content-Disposition": 'attachment; filename="' + fname + '"'})
 
 
 if __name__ == "__main__":

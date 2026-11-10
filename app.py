@@ -1376,12 +1376,10 @@ def fetch(u: str, f: str = "", x_dt_key: str = Header(default="")):
     )
 
 
-@app.post("/subs")
-def subs(payload: dict, x_dt_key: str = Header(default="")):
-    """Subtitle / transcript extraction for the Subtitle Downloader and
-    YouTube Transcript tools. Returns the plain text of the best available
-    subtitle track (manual subtitles first, then automatic captions)."""
-    check_key(x_dt_key)
+def _subs_main(payload: dict):
+    """yt-dlp subtitle extraction (the original /subs body). Raises
+    HTTPException on any failure; the routed wrapper below adds the
+    Invidious captions fallback for YouTube URLs."""
     url = (payload or {}).get("url", "").strip()
     lang = (payload or {}).get("lang", "").strip()
     if not url or not re.match(r"^https?://", url):
@@ -1444,6 +1442,111 @@ def subs(payload: dict, x_dt_key: str = Header(default="")):
     if yt_client is not None:
         result["yt_client"] = yt_client
     return result
+
+
+def subs_invidious(url, lang):
+    """Captions via the Invidious instance for a YouTube video — the
+    fallback when the yt-dlp caption route is walled (added 2026-11-10,
+    the same evening the Invidious download route went live; the video
+    JSON carries a captions list whose files the instance serves
+    itself, so a datacenter client can read them)."""
+    import json as _json
+    video_id = _youtube_video_id(url)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="bad youtube url")
+    last_err = None
+    for inst in INVIDIOUS_INSTANCES:
+        try:
+            req = urllib.request.Request(
+                f"{inst}/api/v1/videos/{video_id}",
+                headers={"User-Agent": INV_UA})
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                data = _json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as e:
+            last_err = e
+            continue
+        captions = data.get("captions") or []
+        if not captions:
+            raise HTTPException(status_code=404,
+                                detail="no subtitles available")
+        def _code(c):
+            return c.get("languageCode") or c.get("language_code") or ""
+        def _label(c):
+            return c.get("label") or ""
+        pick = None
+        if lang:
+            pick = next((c for c in captions if _code(c) == lang), None) \
+                or next((c for c in captions
+                         if _label(c).lower().startswith(lang.lower())),
+                        None)
+        if pick is None:
+            pick = next((c for c in captions
+                         if _code(c) == "en"
+                         and "auto" not in _label(c).lower()), None) \
+                or next((c for c in captions if _code(c) == "en"), None) \
+                or captions[0]
+        cap_url = pick.get("url") or ""
+        if not cap_url:
+            raise HTTPException(status_code=404,
+                                detail="no subtitles available")
+        if cap_url.startswith("/"):
+            cap_url = inst + cap_url
+        raw = None
+        try:
+            req = urllib.request.Request(cap_url,
+                                         headers={"User-Agent": INV_UA})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+        except Exception:
+            try:
+                from curl_cffi import requests as creq
+                r = creq.get(cap_url, headers={"User-Agent": INV_UA},
+                             impersonate="chrome", timeout=30)
+                if r.status_code == 200:
+                    raw = r.text
+            except Exception:
+                raw = None
+        if raw is None:
+            raise HTTPException(status_code=502,
+                                detail="subtitle fetch failed")
+        lines = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or "-->" in line or line.startswith(
+                    ("WEBVTT", "Kind:", "Language:")):
+                continue
+            if line.isdigit():
+                continue
+            line = re.sub(r"<[^>]+>", "", line)
+            if line and (not lines or lines[-1] != line):
+                lines.append(line)
+        text = "\n".join(lines)
+        if not text:
+            raise HTTPException(status_code=404,
+                                detail="no subtitles available")
+        return {"title": data.get("title"), "lang": _code(pick),
+                "available": sorted({_code(c) for c in captions if _code(c)}),
+                "text": text, "yt_client": "invidious"}
+    raise HTTPException(status_code=502,
+                        detail="invidious unavailable: "
+                        + str(last_err)[:150])
+
+
+@app.post("/subs")
+def subs(payload: dict, x_dt_key: str = Header(default="")):
+    """Subtitle / transcript extraction for the Subtitle Downloader and
+    YouTube Transcript tools. Returns the plain text of the best
+    available subtitle track (manual subtitles first, then automatic
+    captions). For YouTube URLs whose yt-dlp route fails, captions are
+    served through the Invidious fallback instead."""
+    check_key(x_dt_key)
+    url = (payload or {}).get("url", "").strip()
+    try:
+        return _subs_main(payload)
+    except HTTPException:
+        if is_youtube_url(url):
+            return subs_invidious(url, (payload or {}).get("lang", "").strip())
+        raise
 
 
 @app.post("/convert")

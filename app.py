@@ -793,6 +793,262 @@ def extract_once(url, extra=None, player_client="KEEP", impersonate=True):
         return ydl.extract_info(url, download=False)
 
 
+# ---------------------------------------------------------------------------
+# Invidious fallback for YouTube (the QGrab recipe, 2026-11-10): every
+# yt-dlp player client is walled off from this datacenter egress
+# (storyboard-only formats, even with the spare account's cookies and a
+# PO-token sidecar), but a public Invidious instance is not: its API
+# returns the real adaptive formats, and with ?local=true the media URLs
+# point at the instance's own /videoplayback proxy, so the file bytes
+# flow through the instance instead of straight from googlevideo (which
+# refuses this egress). No cookies, no paid proxy. The instance list is
+# overridable via env INVIDIOUS_INSTANCES (comma-separated); the default
+# is the one API-enabled public instance found on 2026-11-10. Format ids
+# are minted as "inv:<itag>" so /fetch can route them back here. Video
+# and audio arrive as separate adaptive streams, so /fetch pairs a
+# video-only pick with the best m4a audio and muxes with ffmpeg -c copy
+# (no re-encode; the free container's CPU could not afford one).
+INV_UA = TB_UA
+INVIDIOUS_INSTANCES = [
+    s.strip() for s in os.environ.get(
+        "INVIDIOUS_INSTANCES", "https://yt.chocolatemoo53.com").split(",")
+    if s.strip()]
+_INV_CACHE = {}
+_INV_CACHE_TTL = 600
+
+
+def _youtube_video_id(url):
+    if not url:
+        return None
+    m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?:youtu\.be/|/shorts/|/embed/|/live/|/v/)"
+                  r"([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
+
+
+def _inv_api(video_id):
+    """Invidious video JSON for video_id (600 s in-memory cache, so a
+    /resolve and the /fetch that follows it share one API call). Raises
+    the last error when no instance answers with usable formats."""
+    import json as _json
+    now = time.time()
+    hit = _INV_CACHE.get(video_id)
+    if hit and now - hit[0] < _INV_CACHE_TTL:
+        return hit[1]
+    last_err = None
+    for inst in INVIDIOUS_INSTANCES:
+        api = f"{inst}/api/v1/videos/{video_id}?local=true"
+        try:
+            req = urllib.request.Request(api, headers={"User-Agent": INV_UA})
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                data = _json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as e:
+            last_err = e
+            print(f"[invidious] {inst} failed: {str(e)[:120]}", flush=True)
+            continue
+        if data.get("formatStreams") or data.get("adaptiveFormats"):
+            _INV_CACHE[video_id] = (now, data)
+            return data
+        last_err = yt_dlp.utils.DownloadError(
+            "invidious instance returned no formats")
+    raise last_err or yt_dlp.utils.DownloadError("invidious unavailable")
+
+
+def _inv_height(entry):
+    for key in ("resolution", "qualityLabel"):
+        v = entry.get(key)
+        if v:
+            m = re.search(r"(\d+)\s*p", str(v))
+            if m:
+                return int(m.group(1))
+    return 0
+
+
+def _inv_find(data, itag):
+    """(entry, is_muxed_stream) for an itag, or (None, False)."""
+    for coll, muxed in (("formatStreams", True), ("adaptiveFormats", False)):
+        for e in data.get(coll) or []:
+            if str(e.get("itag")) == str(itag) and e.get("url"):
+                return e, muxed
+    return None, False
+
+
+def resolve_invidious(url):
+    """Shape an Invidious API answer into the standard /resolve result."""
+    video_id = _youtube_video_id(url)
+    if not video_id:
+        raise yt_dlp.utils.DownloadError("invidious: no video id in url")
+    data = _inv_api(video_id)
+    cands = {}
+
+    def offer(entry, has_audio, height):
+        ext = entry.get("container") or "mp4"
+        typ = entry.get("type") or ""
+        if height:
+            pref = 2 if (ext == "mp4" and "avc1" in typ) else \
+                (1 if ext == "mp4" else 0)
+        else:
+            pref = 2 if ext == "m4a" else (1 if ext == "mp4" else 0)
+        try:
+            br = int(entry.get("bitrate") or 0)
+        except Exception:
+            br = 0
+        try:
+            size = int(entry.get("clen") or entry.get("size") or 0) or None
+        except Exception:
+            size = None
+        key = (height, ext, has_audio)
+        cur = cands.get(key)
+        if cur is None or (pref, br) > cur[0]:
+            cands[key] = ((pref, br), {
+                "id": "inv:" + str(entry.get("itag")),
+                "height": height or None,
+                "width": None,
+                "ext": ext,
+                "size": size,
+                "has_audio": has_audio,
+            })
+
+    for e in data.get("formatStreams") or []:
+        offer(e, True, _inv_height(e))
+    for e in data.get("adaptiveFormats") or []:
+        typ = e.get("type") or ""
+        if typ.startswith("audio/"):
+            offer(e, True, 0)
+        elif typ.startswith("video/"):
+            offer(e, False, _inv_height(e))
+    formats = [v[1] for v in cands.values()]
+    formats.sort(key=lambda x: (x["height"] or 0))
+    if not formats:
+        raise yt_dlp.utils.DownloadError("invidious: no usable formats")
+    thumb = None
+    thumbs = data.get("videoThumbnails") or []
+    if thumbs:
+        thumb = max(thumbs, key=lambda t: t.get("width") or 0).get("url")
+    return {
+        "title": data.get("title"),
+        "artist": data.get("author"),
+        "duration": data.get("lengthSeconds"),
+        "thumbnail": thumb,
+        "webpage_url": url,
+        "formats": formats,
+        "yt_client": "invidious",
+    }
+
+
+def _inv_download(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": INV_UA})
+    total = 0
+    with urllib.request.urlopen(req, timeout=60) as resp, \
+            open(dest, "wb") as fh:
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 900 * 1024 * 1024:
+                raise HTTPException(status_code=413,
+                                    detail="file too large")
+            fh.write(chunk)
+    return dest
+
+
+def fetch_invidious(u, f):
+    """Deliver an "inv:<itag>" format: muxed streams and audio download
+    directly through the instance proxy; a video-only pick is paired
+    with the best audio track and muxed with ffmpeg -c copy."""
+    import shutil
+    import subprocess
+    import uuid
+
+    video_id = _youtube_video_id(u)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="bad youtube url")
+    itag = f[4:] if f.startswith("inv:") else f
+    try:
+        data = _inv_api(video_id)
+    except Exception as e:
+        raise HTTPException(status_code=502,
+                            detail="invidious unavailable: " + str(e)[:150])
+    entry, muxed = _inv_find(data, itag)
+    if entry is None:
+        raise HTTPException(status_code=422,
+                            detail="invidious format not found")
+    title = data.get("title") or "video"
+    workdir = os.path.join("/tmp/dt-inv", uuid.uuid4().hex)
+    os.makedirs(workdir, exist_ok=True)
+    typ = entry.get("type") or ""
+    ext = entry.get("container") or "mp4"
+    try:
+        if muxed or typ.startswith("audio/"):
+            kind = "audio" if typ.startswith("audio/") else "video"
+            path = os.path.join(workdir, "media." + ext)
+            _inv_download(entry["url"], path)
+            out_ext = ext
+            media = kind + "/" + ("mp4" if ext == "m4a" else ext)
+        else:
+            audio = None
+            for e in data.get("adaptiveFormats") or []:
+                if (e.get("type") or "").startswith("audio/") and e.get("url"):
+                    score = (1 if e.get("container") == "m4a" else 0,
+                             int(e.get("bitrate") or 0))
+                    if audio is None or score > audio[0]:
+                        audio = (score, e)
+            if audio is None:
+                raise HTTPException(status_code=422,
+                                    detail="invidious: no audio track")
+            audio = audio[1]
+            vsrc = os.path.join(workdir, "video." + ext)
+            asrc = os.path.join(workdir,
+                                "audio." + (audio.get("container") or "m4a"))
+            _inv_download(entry["url"], vsrc)
+            _inv_download(audio["url"], asrc)
+            out_ext = "mp4" if (ext == "mp4"
+                                and audio.get("container") == "m4a") \
+                else "mkv"
+            path = os.path.join(workdir, "merged." + out_ext)
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-i", vsrc, "-i", asrc, "-c", "copy", path],
+                capture_output=True, timeout=300)
+            if proc.returncode != 0 or not os.path.exists(path):
+                raise HTTPException(status_code=422,
+                                    detail="ffmpeg merge failed")
+            media = "video/mp4" if out_ext == "mp4" else "video/x-matroska"
+    except HTTPException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(status_code=502,
+                            detail="invidious download failed: "
+                            + str(e)[:150])
+    filename = safe_name(title) + "." + out_ext
+    size = os.path.getsize(path)
+
+    def stream():
+        try:
+            with open(path, "rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 256)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    return StreamingResponse(
+        stream(),
+        media_type=media,
+        headers={
+            "Content-Disposition": "attachment; filename*=UTF-8''"
+                                   + urllib.parse.quote(filename),
+            "Content-Length": str(size),
+        },
+    )
+
+
 def safe_name(title: str) -> str:
     name = re.sub(r"[^\w\s\-\u0600-\u06FF]", "", title or "video").strip()
     return (name[:80] or "video")
@@ -871,6 +1127,15 @@ def resolve(payload: dict, x_dt_key: str = Header(default="")):
         else:
             info = extract_once(url)
     except yt_dlp.utils.DownloadError as e:
+        if is_youtube_url(url):
+            # Every yt-dlp client is walled off from this egress; the
+            # Invidious fallback speaks for YouTube instead. Its own
+            # failure leaves the original honest error standing.
+            try:
+                return resolve_invidious(url)
+            except Exception as inv_e:
+                print(f"[invidious] resolve fallback failed: "
+                      f"{str(inv_e)[:140]}", flush=True)
         raise HTTPException(status_code=422, detail=str(e)[:300])
     if info.get("_type") == "playlist" or "entries" in info:
         # Playlist URL: the single-video path yields zero formats, so
@@ -925,6 +1190,9 @@ def fetch(u: str, f: str = "", x_dt_key: str = Header(default="")):
     if is_terabox_url(u):
         # Re-resolve the share and stream the fresh dlink (see above).
         return fetch_terabox(u, f)
+    if is_youtube_url(u) and f.startswith("inv:"):
+        # Format ids minted by the Invidious /resolve fallback.
+        return fetch_invidious(u, f)
     fmt = f or "bv*[height<=720]+ba/b[height<=720]/b"
     tmpdir = "/tmp/dt-fetch"
     os.makedirs(tmpdir, exist_ok=True)

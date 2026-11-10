@@ -1297,6 +1297,23 @@ def fetch(u: str, f: str = "", x_dt_key: str = Header(default="")):
                     if os.path.exists(cand):
                         path = cand
                         break
+            if not os.path.exists(path):
+                # HLS downloads (e.g. Vimeo) land under the plain
+                # outtmpl name while prepare_filename points at the
+                # pre-merge ".f<format_id>" name — find the file this
+                # download actually produced (same video id prefix,
+                # newest first) instead of failing (proven 2026-11-10
+                # with a Vimeo Staff Pick: download completed, then
+                # /fetch 500'd on the missing expected path).
+                import glob as _glob
+                cands = [
+                    c for c in _glob.glob(
+                        os.path.join(tmpdir, (info.get("id") or "") + "*"))
+                    if os.path.splitext(c)[1] in (".mp4", ".mkv", ".webm")
+                    and os.path.getsize(c) > 0
+                ]
+                if cands:
+                    path = max(cands, key=lambda c: os.path.getmtime(c))
             return path, (info.get("title") or "video")
 
     try:

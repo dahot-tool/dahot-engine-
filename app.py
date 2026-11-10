@@ -1058,6 +1058,80 @@ def subs(payload: dict, x_dt_key: str = Header(default="")):
     return result
 
 
+@app.post("/convert")
+async def convert(request: Request, mode: str = "mp3", name: str = "video",
+                  start: float = 0.0, dur: float = 5.0,
+                  x_dt_key: str = Header(default="")):
+    # File conversion for the site's Video->MP3 and Video->GIF tools.
+    # The uploaded file arrives as the RAW request body (no multipart, so
+    # no extra dependency); mode/start/dur/name ride in the query string.
+    # ffmpeg does the work; the result streams back as an attachment.
+    check_key(x_dt_key)
+    import asyncio
+    import shutil
+    import subprocess
+    import uuid
+
+    mode = (mode or "mp3").lower()
+    if mode not in ("mp3", "gif"):
+        raise HTTPException(status_code=400, detail="bad mode")
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty upload")
+    if len(data) > 100 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="file too large (100 MB max)")
+
+    base = safe_name(os.path.splitext(name or "video")[0] or "video")
+    workdir = os.path.join("/tmp/dt-convert", uuid.uuid4().hex)
+    os.makedirs(workdir, exist_ok=True)
+    src = os.path.join(workdir, "input.bin")
+    with open(src, "wb") as fh:
+        fh.write(data)
+
+    if mode == "mp3":
+        out = os.path.join(workdir, "output.mp3")
+        cmd = ["ffmpeg", "-y", "-i", src, "-vn",
+               "-codec:a", "libmp3lame", "-q:a", "2", out]
+        media, fname = "audio/mpeg", base + ".mp3"
+    else:
+        start = max(0.0, min(float(start or 0), 3600.0))
+        dur = max(1.0, min(float(dur or 5), 10.0))
+        out = os.path.join(workdir, "output.gif")
+        vf = ("fps=12,scale=480:-1:flags=lanczos,"
+              "split[a][b];[a]palettegen[p];[b][p]paletteuse")
+        cmd = ["ffmpeg", "-y", "-ss", str(start), "-t", str(dur),
+               "-i", src, "-vf", vf, out]
+        media, fname = "image/gif", base + ".gif"
+
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, timeout=240)
+    except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(status_code=500,
+                            detail="conversion failed to start: " + str(e)[:200])
+    if proc.returncode != 0 or not os.path.exists(out):
+        tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(status_code=422,
+                            detail="ffmpeg could not convert this file: " + tail)
+
+    def chunks():
+        try:
+            with open(out, "rb") as fh:
+                while True:
+                    block = fh.read(256 * 1024)
+                    if not block:
+                        break
+                    yield block
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    return StreamingResponse(
+        chunks(), media_type=media,
+        headers={"Content-Disposition": 'attachment; filename="' + fname + '"'})
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))

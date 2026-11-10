@@ -1636,7 +1636,7 @@ async def convert(request: Request, mode: str = "mp3", name: str = "video",
     import uuid
 
     mode = (mode or "mp3").lower()
-    if mode not in ("mp3", "gif"):
+    if mode not in ("mp3", "gif", "enhance"):
         raise HTTPException(status_code=400, detail="bad mode")
     data = await request.body()
     if not data:
@@ -1656,6 +1656,16 @@ async def convert(request: Request, mode: str = "mp3", name: str = "video",
         cmd = ["ffmpeg", "-y", "-i", src, "-vn",
                "-codec:a", "libmp3lame", "-q:a", "2", out]
         media, fname = "audio/mpeg", base + ".mp3"
+    elif mode == "enhance":
+        # Voice Enhancer: reduce steady background noise, lift the
+        # voice band and normalise loudness. Real DSP (ffmpeg afftdn +
+        # loudnorm) — honest "cleaner and clearer", not magic.
+        out = os.path.join(workdir, "output.mp3")
+        af = ("highpass=f=80,afftdn=nr=12:nf=-25,"
+              "loudnorm=I=-16:TP=-1.5:LRA=11")
+        cmd = ["ffmpeg", "-y", "-i", src, "-vn", "-af", af,
+               "-codec:a", "libmp3lame", "-q:a", "2", out]
+        media, fname = "audio/mpeg", base + "-enhanced.mp3"
     else:
         start = max(0.0, min(float(start or 0), 3600.0))
         dur = max(1.0, min(float(dur or 5), 10.0))

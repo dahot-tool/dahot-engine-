@@ -939,14 +939,19 @@ def resolve_invidious(url):
 
 
 def _inv_download(url, dest):
-    """Download one Invidious-proxied media file to dest. The instance's
-    /videoplayback proxy refuses plain urllib's TLS fingerprint from
-    the Back4app egress with HTTP 403 (proven live 2026-11-10: the API
-    answers urllib fine, the media proxy does not — the same lesson as
-    the TeraBox download hosts), so the GET goes through curl_cffi with
-    Chrome impersonation first, with plain urllib kept as fallback."""
+    """Download one Invidious-proxied media file to dest.
+
+    The media proxy gates on the request looking like a real browser:
+    from a plain client it answers HTTP 403 even with the right URL
+    (probed 2026-11-10: no-UA and stock-urllib requests are refused,
+    a Chrome UA is served). Production containers were still refused
+    with a Chrome UA on both the curl_cffi-impersonated and urllib
+    stacks, so every attempt's outcome — status plus a snippet of any
+    refusal body — is collected and reported in the raised error,
+    naming the wall instead of hiding it."""
     headers = {"User-Agent": INV_UA, "Accept": "*/*"}
     cap = 900 * 1024 * 1024
+    attempts = []
 
     def _write(stream):
         total = 0
@@ -960,38 +965,56 @@ def _inv_download(url, dest):
                                         detail="file too large")
                 fh.write(chunk)
 
-    creq_status = None
+    def _snip(text):
+        return re.sub(r"\s+", " ", (text or ""))[:140]
+
     try:
         from curl_cffi import requests as creq
     except Exception:
         creq = None
     if creq is not None:
-        resp = None
-        try:
-            resp = creq.get(url, headers=headers, impersonate="chrome",
-                            stream=True, timeout=120, allow_redirects=True)
-            if resp.status_code == 200:
-                _write(resp.iter_content(chunk_size=1024 * 256))
-                return dest
-            creq_status = resp.status_code
-        except HTTPException:
-            raise
-        except Exception:
-            creq_status = creq_status or "error"
-        finally:
-            if resp is not None:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
+        for label, hdrs in (("creq-chrome/engine-ua", headers),
+                            ("creq-chrome/default-ua", None)):
+            resp = None
+            try:
+                resp = creq.get(url, headers=hdrs, impersonate="chrome",
+                                stream=True, timeout=120,
+                                allow_redirects=True)
+                if resp.status_code == 200:
+                    _write(resp.iter_content(chunk_size=1024 * 256))
+                    return dest
+                attempts.append(f"{label}: HTTP {resp.status_code} "
+                                f"{_snip(resp.text)}")
+            except HTTPException:
+                raise
+            except Exception as e:
+                attempts.append(f"{label}: {type(e).__name__}")
+            finally:
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
     try:
-        os.remove(dest)
-    except OSError:
-        pass
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        _write(iter(lambda: resp.read(1024 * 256), b""))
-    return dest
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            _write(iter(lambda: resp.read(1024 * 256), b""))
+        return dest
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read(400).decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        attempts.append(f"urllib: HTTP {e.code} {_snip(body)}")
+    except Exception as e:
+        attempts.append(f"urllib: {type(e).__name__}")
+    raise HTTPException(
+        status_code=502,
+        detail="invidious media refused: " + " | ".join(attempts)[:600])
 
 
 def fetch_invidious(u, f):

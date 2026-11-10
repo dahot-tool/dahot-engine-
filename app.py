@@ -987,12 +987,20 @@ def _inv_download(url, dest):
     except Exception:
         creq = None
     if creq is not None:
+        stalled = False
         for label, hdrs in (("creq-chrome/engine-ua", headers),
                             ("creq-chrome/default-ua", None)):
+            if stalled:
+                # A stall means the proxy itself is hanging on this
+                # media (seen 2026-11-10: one video's streams crawled
+                # while another's were fast) — a different UA will not
+                # unstick it; fall through to the urllib attempt fast
+                # instead of doubling the wait.
+                break
             resp = None
             try:
                 resp = creq.get(url, headers=hdrs, impersonate="chrome",
-                                stream=True, timeout=120,
+                                stream=True, timeout=45,
                                 allow_redirects=True)
                 if resp.status_code == 200:
                     _write(resp.iter_content(chunk_size=1024 * 256))
@@ -1003,6 +1011,9 @@ def _inv_download(url, dest):
                 raise
             except Exception as e:
                 attempts.append(f"{label}: {type(e).__name__}")
+                if "timeout" in type(e).__name__.lower() \
+                        or "timed out" in str(e).lower():
+                    stalled = True
             finally:
                 if resp is not None:
                     try:
@@ -1015,7 +1026,7 @@ def _inv_download(url, dest):
                 pass
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             _write(iter(lambda: resp.read(1024 * 256), b""))
         return dest
     except urllib.error.HTTPError as e:
@@ -1079,8 +1090,16 @@ def fetch_invidious(u, f):
             vsrc = os.path.join(workdir, "video." + ext)
             asrc = os.path.join(workdir,
                                 "audio." + (audio.get("container") or "m4a"))
-            _inv_download(entry["url"], vsrc)
-            _inv_download(audio["url"], asrc)
+            # Video and audio come from the same proxy — fetch them in
+            # parallel so a slow stream does not double the wait
+            # (serial fetches pushed some videos past every timeout
+            # downstream, 2026-11-10).
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_v = pool.submit(_inv_download, entry["url"], vsrc)
+                fut_a = pool.submit(_inv_download, audio["url"], asrc)
+                fut_v.result()
+                fut_a.result()
             out_ext = "mp4" if (ext == "mp4"
                                 and audio.get("container") == "m4a") \
                 else "mkv"

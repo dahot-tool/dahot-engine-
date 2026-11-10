@@ -1695,6 +1695,64 @@ async def convert(request: Request, mode: str = "mp3", name: str = "video",
         headers={"Content-Disposition": 'attachment; filename="' + fname + '"'})
 
 
+def _tts_chunks(text, limit=180):
+    """Split text into <=limit-char chunks on sentence boundaries."""
+    import re as _re
+    parts = _re.split(r"(?<=[.!?\n\u06d4])\s+", text.strip())
+    chunks, cur = [], ""
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        while len(p) > limit:
+            cut = p.rfind(" ", 0, limit)
+            if cut < 40:
+                cut = limit
+            chunks.append(p[:cut].strip())
+            p = p[cut:].strip()
+        if len(cur) + len(p) + 1 <= limit:
+            cur = (cur + " " + p).strip()
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = p
+    if cur:
+        chunks.append(cur)
+    return chunks[:12]
+
+
+@app.post("/tts")
+def tts(payload: dict, x_dt_key: str = Header(default="")):
+    """AI Voiceover: real speech from text (Google Translate TTS route —
+    free, no key). Returns one MP3 (chunks concatenated)."""
+    check_key(x_dt_key)
+    text = (payload.get("text") or "").strip()
+    lang = (payload.get("lang") or "en").strip().lower()[:5] or "en"
+    if not text:
+        raise HTTPException(400, "No text given.")
+    if len(text) > 1200:
+        text = text[:1200]
+    audio = b""
+    for chunk in _tts_chunks(text):
+        q = urllib.parse.urlencode(
+            {"ie": "UTF-8", "q": chunk, "tl": lang, "client": "tw-ob"})
+        req = urllib.request.Request(
+            "https://translate.google.com/translate_tts?" + q,
+            headers={"User-Agent": TB_UA, "Referer": "https://translate.google.com/"})
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                data = resp.read()
+        except Exception as e:
+            raise HTTPException(502, f"Voice service failed: {e}")
+        if len(data) < 200:
+            raise HTTPException(502, "Voice service returned no audio.")
+        audio += data
+    if len(audio) < 500:
+        raise HTTPException(502, "Voice service returned no audio.")
+    return Response(content=audio, media_type="audio/mpeg", headers={
+        "Content-Disposition": 'attachment; filename="dahot-voiceover.mp3"'})
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))

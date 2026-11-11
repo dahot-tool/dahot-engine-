@@ -1806,33 +1806,38 @@ def tts(payload: dict, x_dt_key: str = Header(default="")):
 @app.post("/thumbs")
 def thumbs(payload: dict, x_dt_key: str = Header(default="")):
     """Naam-search result covers for TikTok (added 2026-11-11 at
-    Rashid's order: search cards showed only the platform logo). The
-    Supabase edge function's own egress gets throttled by the tikwm
-    API after the first call, while this engine's egress does not —
-    so TikTok covers are fetched here, one by one. Body: {urls: [...]}
-    (max 10). Returns {thumbs: {url: cover-or-null}}. A failure for
-    any URL just yields null for that URL (the site then shows the
-    platform tile), never an error for the whole batch."""
+    Rashid's order: search cards showed only the platform logo).
+    First route was the tikwm API, but tikwm refuses this engine's
+    egress AND the edge function's egress (only the first call went
+    through there; both engines got nulls) — while this engine's own
+    yt-dlp extraction resolves TikTok fine (it powers downloads), so
+    covers are taken from the extracted info's thumbnail field.
+    Body: {urls: [...]} (max 10). Returns {thumbs: {url: cover-or-
+    null}}. Extractions run 4 at a time (~2s each measured live);
+    a failure for any URL just yields null for that URL (the site
+    then shows the platform tile), never an error for the batch."""
     check_key(x_dt_key)
     urls = payload.get("urls") or []
     if not isinstance(urls, list):
         raise HTTPException(400, "urls must be a list.")
+    links = [str(u or "") for u in urls[:10]]
+
+    def one(link: str):
+        if "tiktok.com" not in link:
+            return link, None
+        try:
+            info = extract_once(link)
+            t = str(info.get("thumbnail") or "")
+            return link, (t if t.startswith("http") else None)
+        except Exception:
+            return link, None
+
     out = {}
-    for u in urls[:10]:
-        link = str(u or "")
-        cover = None
-        if "tiktok.com" in link:
-            try:
-                api = "https://www.tikwm.com/api/?url=" + urllib.parse.quote(link, safe="")
-                req = urllib.request.Request(api, headers={"User-Agent": TB_UA})
-                with urllib.request.urlopen(req, timeout=12) as resp:
-                    tj = json.loads(resp.read().decode("utf-8", "replace"))
-                c = str((tj.get("data") or {}).get("cover") or "")
-                if c.startswith("http"):
-                    cover = c
-            except Exception:
-                cover = None
-        out[link] = cover
+    if links:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for link, cover in pool.map(one, links):
+                out[link] = cover
     return {"thumbs": out}
 
 

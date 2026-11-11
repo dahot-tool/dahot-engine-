@@ -1803,6 +1803,39 @@ def tts(payload: dict, x_dt_key: str = Header(default="")):
         "Content-Disposition": 'attachment; filename="dahot-voiceover.mp3"'})
 
 
+@app.post("/thumbs")
+def thumbs(payload: dict, x_dt_key: str = Header(default="")):
+    """Naam-search result covers for TikTok (added 2026-11-11 at
+    Rashid's order: search cards showed only the platform logo). The
+    Supabase edge function's own egress gets throttled by the tikwm
+    API after the first call, while this engine's egress does not —
+    so TikTok covers are fetched here, one by one. Body: {urls: [...]}
+    (max 10). Returns {thumbs: {url: cover-or-null}}. A failure for
+    any URL just yields null for that URL (the site then shows the
+    platform tile), never an error for the whole batch."""
+    check_key(x_dt_key)
+    urls = payload.get("urls") or []
+    if not isinstance(urls, list):
+        raise HTTPException(400, "urls must be a list.")
+    out = {}
+    for u in urls[:10]:
+        link = str(u or "")
+        cover = None
+        if "tiktok.com" in link:
+            try:
+                api = "https://www.tikwm.com/api/?url=" + urllib.parse.quote(link, safe="")
+                req = urllib.request.Request(api, headers={"User-Agent": TB_UA})
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    tj = json.loads(resp.read().decode("utf-8", "replace"))
+                c = str((tj.get("data") or {}).get("cover") or "")
+                if c.startswith("http"):
+                    cover = c
+            except Exception:
+                cover = None
+        out[link] = cover
+    return {"thumbs": out}
+
+
 # ---------------------------------------------------------------------------
 # AI Video / AI Music generators.
 #

@@ -1964,13 +1964,27 @@ def _gen_error_detail(err_text):
     return "The generation failed on the service side. Please try again.", False
 
 
+def _hf_auth_headers(base=None):
+    """Headers for Hugging Face Space calls. When the HF_TOKEN env var
+    is set (Rashid's own Hugging Face account token — he approved this
+    route 2026-11-11), calls carry it so the Spaces' ZeroGPU time is
+    billed to his account's larger free quota instead of the tiny
+    anonymous budget that kept running out during the 2026-11-11
+    rechecks. Without the env var, behaviour is exactly as before."""
+    h = dict(base or {})
+    tok = os.environ.get("HF_TOKEN", "").strip()
+    if tok:
+        h["Authorization"] = "Bearer " + tok
+    return h
+
+
 def _hf_sse_once(space, session_hash, deadline):
     """One SSE pass over the Gradio queue/data stream. Returns the result
     file URL on completion, None when the stream ends/drops without a
     terminal message (the caller reconnects), and raises _GenFail for
     failures the service itself reported."""
     url = space + "/gradio_api/queue/data?session_hash=" + session_hash
-    req = urllib.request.Request(url, headers={"User-Agent": TB_UA})
+    req = urllib.request.Request(url, headers=_hf_auth_headers({"User-Agent": TB_UA}))
     try:
         resp = urllib.request.urlopen(
             req, timeout=max(5.0, min(45.0, deadline - time.time())))
@@ -2025,7 +2039,7 @@ def _hf_queue_file_url(space, fn_index, data, deadline):
                         "session_hash": session_hash}).encode("utf-8")
     req = urllib.request.Request(
         space + "/gradio_api/queue/join", data=body, method="POST",
-        headers={"User-Agent": TB_UA, "Content-Type": "application/json"})
+        headers=_hf_auth_headers({"User-Agent": TB_UA, "Content-Type": "application/json"}))
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             join = _json.loads(resp.read().decode("utf-8", "replace"))
@@ -2064,7 +2078,7 @@ def _gen_download(job_id, kind, file_url, deadline):
                        ".flac": "audio/flac", ".ogg": "audio/ogg"}}[kind][ext]
     fname = ("dahot-ai-video" if kind == "video" else "dahot-ai-music") + ext
     path = os.path.join(GEN_DIR, job_id + ext)
-    req = urllib.request.Request(file_url, headers={"User-Agent": TB_UA})
+    req = urllib.request.Request(file_url, headers=_hf_auth_headers({"User-Agent": TB_UA}))
     try:
         with urllib.request.urlopen(
                 req, timeout=max(10.0, min(60.0, deadline - time.time()))) as resp, \

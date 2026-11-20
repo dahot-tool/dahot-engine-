@@ -17,6 +17,9 @@ A small HTTP service around yt-dlp:
                                -> {"job": id}: AI generation on public HF
                                   Spaces; poll GET /genjob/<id> -> working /
                                   error JSON, or the finished file itself.
+  POST /editimage {"image_b64":..., "prompt":...}
+                               -> {"job": id}: AI photo edit on a public HF
+                                  Space; poll GET /genjob/<id> the same way.
 
 Access is gated by the shared header X-DT-Key (env DT_ENGINE_KEY) so the free
 hosting quota cannot be abused by strangers. Plan limits (Free/Premium,
@@ -1873,6 +1876,9 @@ LTX_SPACE = "https://lightricks-ltx-video-distilled.hf.space"
 LTX_FN_INDEX = 4        # config dependency index of api_name "text_to_video"
 ACE_SPACE = "https://ace-step-ace-step.hf.space"
 ACE_FN_INDEX = 11       # config dependency index of api_name "__call__"
+QWEN_SPACE = "https://qwen-qwen-image-edit.hf.space"
+QWEN_FN_INDEX = 2       # config dependency index of api_name "infer"
+EDIT_MAX_BYTES = 4 * 1024 * 1024    # decoded-image cap for /editimage
 
 _gen_jobs = {}          # id -> {kind, state, created, path, media, filename, detail}
 _gen_lock = _threading.Lock()
@@ -2068,15 +2074,19 @@ def _gen_download(job_id, kind, file_url, deadline):
     """Download the finished file into GEN_DIR. Returns
     (path, media_type, filename)."""
     exts = (".mp4", ".webm", ".mov") if kind == "video" else \
-        (".mp3", ".wav", ".flac", ".ogg")
+        (".mp3", ".wav", ".flac", ".ogg") if kind == "music" else \
+        (".png", ".jpg", ".jpeg", ".webp")
     ext = os.path.splitext(urllib.parse.urlparse(file_url).path)[1].lower()
     if ext not in exts:
         ext = exts[0]
     media = {"video": {".mp4": "video/mp4", ".webm": "video/webm",
                        ".mov": "video/quicktime"},
              "music": {".mp3": "audio/mpeg", ".wav": "audio/wav",
-                       ".flac": "audio/flac", ".ogg": "audio/ogg"}}[kind][ext]
-    fname = ("dahot-ai-video" if kind == "video" else "dahot-ai-music") + ext
+                       ".flac": "audio/flac", ".ogg": "audio/ogg"},
+             "image": {".png": "image/png", ".jpg": "image/jpeg",
+                       ".jpeg": "image/jpeg", ".webp": "image/webp"}}[kind][ext]
+    fname = {"video": "dahot-ai-video", "music": "dahot-ai-music",
+             "image": "dahot-ai-photo-edit"}[kind] + ext
     path = os.path.join(GEN_DIR, job_id + ext)
     req = urllib.request.Request(file_url, headers=_hf_auth_headers({"User-Agent": TB_UA}))
     try:
@@ -2126,7 +2136,93 @@ def _gen_worker(job_id, kind, space, fn_index, data, timeout_s):
             job.update(state="error", detail=detail)
 
 
-def _gen_start(kind, space, fn_index, data, timeout_s):
+def _hf_upload_file(space, file_path, filename, mime):
+    """Upload one local file to a Gradio Space (POST /gradio_api/upload)
+    and return the server-side path the queue/join data must reference
+    for a file input. Raises _GenFail(transient=True) on transport
+    trouble, like the rest of the HF helpers."""
+    boundary = "----dahot" + _uuid.uuid4().hex[:16]
+    with open(file_path, "rb") as fh:
+        blob = fh.read()
+    body = b"".join([
+        ("--" + boundary + "\r\n").encode("utf-8"),
+        ('Content-Disposition: form-data; name="files"; filename="' +
+         filename + '"\r\n').encode("utf-8"),
+        ("Content-Type: " + mime + "\r\n\r\n").encode("utf-8"),
+        blob,
+        b"\r\n",
+        ("--" + boundary + "--\r\n").encode("utf-8"),
+    ])
+    req = urllib.request.Request(
+        space + "/gradio_api/upload", data=body, method="POST",
+        headers=_hf_auth_headers(
+            {"User-Agent": TB_UA,
+             "Content-Type": "multipart/form-data; boundary=" + boundary}))
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            got = _json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        raise _GenFail("The generation service could not be reached. "
+                       "Please try again.", transient=True)
+    if not got or not isinstance(got, list) or not got[0]:
+        raise _GenFail("The generation service could not be reached. "
+                       "Please try again.", transient=True)
+    return got[0]
+
+
+def _edit_worker(job_id, kind, space, fn_index, data, timeout_s):
+    """Worker for /editimage jobs: upload the caller's photo to the
+    Qwen-Image-Edit Space, run its queue with the edit instruction,
+    download the edited image. Same retry contract as _gen_worker; the
+    temp upload file is always removed afterwards."""
+    deadline = time.time() + timeout_s
+    detail = "The generation failed. Please try again."
+    tmp_path = data["tmp_path"]
+    try:
+        for _attempt in (1, 2):     # one automatic retry, transient only
+            try:
+                up_path = _hf_upload_file(space, tmp_path,
+                                          data["filename"], data["mime"])
+                filedata = {"path": up_path, "orig_name": data["filename"],
+                            "mime_type": data["mime"],
+                            "meta": {"_type": "gradio.FileData"}}
+                # Parameter order/defaults from the Space's live config
+                # (dependency "infer", verified 2026-11-20): image,
+                # prompt, seed, randomize seed, true guidance scale,
+                # inference steps, rewrite prompt.
+                join_data = [filedata, data["prompt"], 0, True, 4.0, 50, True]
+                file_url = _hf_queue_file_url(space, fn_index, join_data,
+                                              deadline)
+                path, media, fname = _gen_download(job_id, kind, file_url,
+                                                   deadline)
+                with _gen_lock:
+                    job = _gen_jobs.get(job_id)
+                    if job:
+                        job.update(state="done", path=path, media=media,
+                                   filename=fname)
+                return
+            except _GenFail as e:
+                detail = e.detail
+                if not e.transient:
+                    break
+            except Exception:
+                detail = ("The generation service could not be reached. "
+                          "Please try again.")
+            if time.time() >= deadline:
+                break
+            time.sleep(2)
+        with _gen_lock:
+            job = _gen_jobs.get(job_id)
+            if job:
+                job.update(state="error", detail=detail)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _gen_start(kind, space, fn_index, data, timeout_s, worker=None):
     with _gen_lock:
         _gen_housekeeping_locked()
         active = sum(1 for j in _gen_jobs.values() if j["state"] == "working")
@@ -2138,7 +2234,7 @@ def _gen_start(kind, space, fn_index, data, timeout_s):
         _gen_jobs[job_id] = {"id": job_id, "kind": kind, "state": "working",
                              "created": time.time(), "path": None,
                              "media": None, "filename": None, "detail": None}
-    _threading.Thread(target=_gen_worker,
+    _threading.Thread(target=worker or _gen_worker,
                       args=(job_id, kind, space, fn_index, data, timeout_s),
                       daemon=True).start()
     return {"job": job_id}
@@ -2185,6 +2281,58 @@ def genmusic(payload: dict, x_dt_key: str = Header(default="")):
             10.0, None, 0.5, 0.0, 3.0, True, False, True, None, 0.0, 0.0,
             False, 0.5, None, "none"]
     return _gen_start("music", ACE_SPACE, ACE_FN_INDEX, data, 180)
+
+
+@app.post("/editimage")
+def editimage(payload: dict, x_dt_key: str = Header(default="")):
+    """AI Photo Editor: photo + edit instruction -> edited image
+    (Qwen-Image-Edit on a public HF Space). Job pattern: returns
+    {"job": id} immediately; poll /genjob/<id> for the file. The photo
+    arrives base64-encoded (max ~4 MB decoded) and is written to a temp
+    file the worker uploads to the Space, then deletes."""
+    check_key(x_dt_key)
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(400, "No prompt given.")
+    prompt = prompt[:500]
+    b64 = (payload.get("image_b64") or "").strip()
+    if b64.startswith("data:") and "," in b64[:64]:
+        b64 = b64.split(",", 1)[1]
+    if not b64:
+        raise HTTPException(400, "No image given.")
+    if len(b64) > (EDIT_MAX_BYTES * 4 // 3) + 1024:
+        raise HTTPException(413, "Image too large.")
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        raise HTTPException(400, "Image is not valid base64.")
+    if not raw or len(raw) > EDIT_MAX_BYTES:
+        raise HTTPException(413, "Image too large.")
+    # Sniff the real type from the magic bytes (drives the upload's
+    # filename/mime); anything else is rejected rather than guessed.
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        ext, mime = ".png", "image/png"
+    elif raw[:3] == b"\xff\xd8\xff":
+        ext, mime = ".jpg", "image/jpeg"
+    elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        ext, mime = ".webp", "image/webp"
+    else:
+        raise HTTPException(
+            400, "Unsupported image type (use PNG, JPEG or WebP).")
+    tmp_path = os.path.join(GEN_DIR, "edit-" + _uuid.uuid4().hex[:12] + ext)
+    with open(tmp_path, "wb") as fh:
+        fh.write(raw)
+    data = {"tmp_path": tmp_path, "prompt": prompt,
+            "filename": "image" + ext, "mime": mime}
+    try:
+        return _gen_start("image", QWEN_SPACE, QWEN_FN_INDEX, data, 300,
+                          worker=_edit_worker)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
 @app.get("/genjob/{job_id}")

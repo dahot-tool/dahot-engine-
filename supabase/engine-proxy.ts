@@ -453,6 +453,183 @@ serve(async (req) => {
       return new Response(r.body, { status: 200, headers });
     }
 
+    if (action === "webcheck") {
+      // v110 website checkers (Ping, Is It Down, Server Status, Page
+      // Snooper, Redirect Checker, Open Graph Checker, Meta Tags
+      // Analyzer, sitemap discovery): the proxy fetches the target
+      // page itself from Deno egress — browsers cannot fetch arbitrary
+      // sites directly (CORS) — and answers structured facts.
+      // body: { url, mode } — mode "status" | "redirects" | "source" | "meta".
+      const mode = String(body.mode ?? "status");
+      let target = String(body.url ?? "").trim();
+      if (target && !/^https?:\/\//i.test(target)) target = "https://" + target;
+      let u: URL;
+      try { u = new URL(target); } catch { return new Response(JSON.stringify({ error: "bad_url" }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } }); }
+      if (u.protocol !== "http:" && u.protocol !== "https:") {
+        return new Response(JSON.stringify({ error: "bad_url" }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+      }
+      const hostLc = u.hostname.toLowerCase();
+      if (hostLc === "localhost" || hostLc.endsWith(".local") || /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(hostLc)) {
+        return new Response(JSON.stringify({ error: "blocked_host" }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+      }
+      const ua = { "User-Agent": "Mozilla/5.0 (compatible; DahotToolChecker/1.0)" };
+      const t0 = Date.now();
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15000);
+      try {
+        if (mode === "redirects") {
+          const chain: { url: string; status: number }[] = [];
+          let cur = u.toString();
+          for (let hop = 0; hop < 11; hop++) {
+            const r = await fetch(cur, { redirect: "manual", signal: ctrl.signal, headers: ua });
+            chain.push({ url: cur, status: r.status });
+            const loc = r.headers.get("location");
+            try { await r.body?.cancel(); } catch { /* noop */ }
+            if (r.status >= 300 && r.status < 400 && loc) { cur = new URL(loc, cur).toString(); continue; }
+            break;
+          }
+          clearTimeout(timer);
+          return new Response(JSON.stringify({ ok: true, mode, chain, finalUrl: chain.length ? chain[chain.length - 1].url : u.toString(), finalStatus: chain.length ? chain[chain.length - 1].status : 0, ms: Date.now() - t0 }), { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+        }
+        const r = await fetch(u.toString(), { redirect: "follow", signal: ctrl.signal, headers: ua });
+        const ms = Date.now() - t0;
+        const base = { ok: true, mode, status: r.status, finalUrl: r.url, ms, contentType: r.headers.get("content-type") ?? "", server: r.headers.get("server") ?? "" };
+        if (mode === "status") {
+          try { await r.body?.cancel(); } catch { /* noop */ }
+          clearTimeout(timer);
+          return new Response(JSON.stringify(base), { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+        }
+        let html = await r.text();
+        const sizeBytes = html.length;
+        if (html.length > 700000) html = html.slice(0, 700000);
+        clearTimeout(timer);
+        if (mode === "source") {
+          return new Response(JSON.stringify({ ...base, sizeBytes, html }), { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+        }
+        // mode "meta": pull the on-page SEO facts out of the HTML.
+        const metas: Record<string, string> = {};
+        for (const m of html.matchAll(/<meta\s+[^>]*>/gi)) {
+          const tag = m[0];
+          const km = tag.match(/(?:name|property)\s*=\s*["']([^"']+)["']/i);
+          const vm = tag.match(/content\s*=\s*["']([^"']*)["']/i);
+          const key = km ? km[1].toLowerCase() : "";
+          if (key && !(key in metas)) metas[key] = (vm ? vm[1] : "").trim().slice(0, 500);
+        }
+        const titleM = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+        const canonM = html.match(/<link[^>]+rel\s*=\s*["']canonical["'][^>]*>/i);
+        const canonH = canonM ? (canonM[0].match(/href\s*=\s*["']([^"']+)["']/i)?.[1] ?? "") : "";
+        const h1s = [...html.matchAll(/<h1[^>]*>([\s\S]*?)<\/h1>/gi)].map((x) => x[1].replace(/<[^>]+>/g, "").trim());
+        const imgs = [...html.matchAll(/<img\s+[^>]*>/gi)];
+        const imgNoAlt = imgs.filter((x) => !/\salt\s*=\s*["'][^"']+["']/i.test(x[0])).length;
+        const textOnly = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ");
+        const meta = {
+          title: titleM ? titleM[1].trim().slice(0, 300) : "",
+          description: metas["description"] ?? "",
+          keywords: metas["keywords"] ?? "",
+          robotsMeta: metas["robots"] ?? "",
+          canonical: canonH,
+          viewport: "viewport" in metas,
+          charset: /<meta[^>]+charset/i.test(html),
+          og: { title: metas["og:title"] ?? "", description: metas["og:description"] ?? "", image: metas["og:image"] ?? "", type: metas["og:type"] ?? "", url: metas["og:url"] ?? "" },
+          twitter: { card: metas["twitter:card"] ?? "", title: metas["twitter:title"] ?? "", description: metas["twitter:description"] ?? "", image: metas["twitter:image"] ?? "" },
+          h1Count: h1s.length, h1First: (h1s[0] ?? "").slice(0, 200),
+          h2Count: (html.match(/<h2[\s>]/gi) ?? []).length,
+          imgCount: imgs.length, imgNoAlt,
+          wordCount: textOnly.split(/\s+/).filter(Boolean).length,
+        };
+        return new Response(JSON.stringify({ ...base, sizeBytes, meta }), { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+      } catch (e) {
+        clearTimeout(timer);
+        return new Response(JSON.stringify({ ok: false, error: "fetch_failed", detail: String(e).slice(0, 200), ms: Date.now() - t0 }), { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+      }
+    }
+
+    if (action === "serp") {
+      // v110 SEO checkers on Serper (Keyword Position Checker, Google
+      // Index Checker, Indexed Pages Checker). Shares psearch's daily
+      // caps, so the one-time 2,500 free grant is protected the same
+      // way: per-caller 10/day, global 250/day (Asia/Karachi).
+      const SERPER_API_KEY = Deno.env.get("SERPER_API_KEY") ?? "";
+      if (!SERPER_API_KEY) {
+        return new Response(JSON.stringify({ error: "search_not_configured" }), { status: 500, headers: { ...cors, "Content-Type": "application/json" } });
+      }
+      const q = String(body.q ?? "").slice(0, 200).trim();
+      const num = Math.min(20, Math.max(1, Number(body.num ?? 10) || 10));
+      if (!q) return new Response(JSON.stringify({ error: "bad_search" }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+      const psDayStr = psDay();
+      const psKey = await psCallerKey(req);
+      const psBefore = await psCounts(psDayStr, psKey);
+      if (psBefore && (psBefore.user >= PS_USER_CAP || psBefore.global >= PS_GLOBAL_CAP)) {
+        return new Response(JSON.stringify({ error: "daily_limit_reached" }), { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+      }
+      const r = await fetch("https://google.serper.dev/search", {
+        method: "POST",
+        headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ q, num }),
+      });
+      if (!r.ok) {
+        const detail = (await r.text()).slice(0, 300);
+        return new Response(JSON.stringify({ error: "search_failed", status: r.status, detail }), { status: 502, headers: { ...cors, "Content-Type": "application/json" } });
+      }
+      const data = await r.json();
+      if (psBefore) psBump(psDayStr, psKey, psBefore.user);
+      const organic: { position: number; title: string; link: string }[] = [];
+      let pos = 0;
+      for (const it of (data.organic ?? [])) {
+        pos++;
+        organic.push({ position: Number(it?.position ?? pos), title: String(it?.title ?? ""), link: String(it?.link ?? "") });
+      }
+      return new Response(JSON.stringify({ organic }), { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+    }
+
+    if (action === "psi") {
+      // v110 PageSpeed Insights proxy (Website SEO Score Checker,
+      // Page Speed Test, Mobile Friendly Test). Keyless calls work
+      // but are quota-tight; if a PAGESPEED_API_KEY secret is ever
+      // set, it is used automatically.
+      let target = String(body.url ?? "").trim();
+      if (target && !/^https?:\/\//i.test(target)) target = "https://" + target;
+      try { new URL(target); } catch { return new Response(JSON.stringify({ error: "bad_url" }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } }); }
+      const strategy = String(body.strategy ?? "mobile") === "desktop" ? "desktop" : "mobile";
+      const key = Deno.env.get("PAGESPEED_API_KEY") ?? "";
+      const api = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=" + encodeURIComponent(target) +
+        "&strategy=" + strategy + "&category=performance&category=accessibility&category=best-practices&category=seo" + (key ? "&key=" + encodeURIComponent(key) : "");
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 55000);
+      try {
+        const r = await fetch(api, { signal: ctrl.signal });
+        clearTimeout(timer);
+        if (!r.ok) {
+          const detail = (await r.text()).slice(0, 300);
+          return new Response(JSON.stringify({ error: "psi_failed", status: r.status, detail }), { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+        }
+        const data = await r.json();
+        const cats = data?.lighthouseResult?.categories ?? {};
+        const audits = data?.lighthouseResult?.audits ?? {};
+        const num = (id: string) => { const a = audits[id]; return a && typeof a.numericValue === "number" ? Math.round(a.numericValue) : null; };
+        const scores: Record<string, number | null> = {};
+        for (const k of ["performance", "accessibility", "best-practices", "seo"]) {
+          const s = cats[k]?.score;
+          scores[k] = typeof s === "number" ? Math.round(s * 100) : null;
+        }
+        return new Response(JSON.stringify({
+          ok: true, strategy, scores,
+          metrics: {
+            lcp: num("largest-contentful-paint"),
+            cls: typeof audits["cumulative-layout-shift"]?.numericValue === "number" ? audits["cumulative-layout-shift"].numericValue : null,
+            tbt: num("total-blocking-time"),
+            fcp: num("first-contentful-paint"),
+            si: num("speed-index"),
+            inp: num("interaction-to-next-paint"),
+          },
+          finalUrl: data?.lighthouseResult?.finalDisplayedUrl ?? data?.id ?? target,
+        }), { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+      } catch (e) {
+        clearTimeout(timer);
+        return new Response(JSON.stringify({ error: "psi_failed", detail: String(e).slice(0, 200) }), { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+      }
+    }
+
     return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
   } catch (e) {
     return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...cors, "Content-Type": "application/json" } });

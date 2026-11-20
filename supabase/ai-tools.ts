@@ -79,6 +79,14 @@ ${COMMON}
 Format: a numbered list 1. to 10., one hook per line, each under 15 words, each using a different angle (question, shocking fact, mistake warning, curiosity gap, challenge, story start, number promise, myth bust, before/after, direct call-out).
 ${COMMON}`,
 
+  writer: `You are an expert writer. The user gives a topic — it may also name the kind of piece (blog post, essay, article, product description, social post, story, letter) and a tone or length; if it does, follow that.
+Rules:
+- Write the finished piece only — ready to copy and use. No introduction about yourself, no "Here is...", no explanation.
+- If no kind is named, write a clear, well-structured short article (about 250-350 words) with a fitting heading on the first line.
+- Match the language and script of the topic (English stays English, Roman Urdu stays Roman Urdu, Urdu script stays Urdu script).
+- Be original and specific: real detail and examples, no filler clichés, no false claims presented as fact.
+- Use short paragraphs; add subheadings or a list only when they genuinely help.`,
+
   paraphrase: `You are an expert writing editor. The user gives a text and a style; rewrite the text in that style.
 Styles: "Simple" = easy everyday words, short clear sentences; "Formal" = polite, professional, well-structured; "Shorter" = the same meaning in noticeably fewer words; "More detailed" = fuller, richer, with helpful detail added without inventing facts.
 Rules:

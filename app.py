@@ -20,6 +20,16 @@ A small HTTP service around yt-dlp:
   POST /editimage {"image_b64":..., "prompt":...}
                                -> {"job": id}: AI photo edit on a public HF
                                   Space; poll GET /genjob/<id> the same way.
+  POST /vvcimg?token=<hex>     -> raw-body picture upload for a Visual
+                                  Voice Creator session (max 4 pictures).
+  POST /vvccap {"token":..., "srt":...}
+                               -> stores the session's captions SRT.
+  POST /vvc?voicestyle=&visualset=&token=&npics=
+                               -> {"job": id}: Visual Voice Creator —
+                                  the caller's video (raw body) keeps only
+                                  its own enhanced voice; new slideshow
+                                  visuals are rendered with ffmpeg; poll
+                                  GET /genjob/<id> for the finished MP4.
 
 Access is gated by the shared header X-DT-Key (env DT_ENGINE_KEY) so the free
 hosting quota cannot be abused by strangers. Plan limits (Free/Premium,
@@ -2366,6 +2376,379 @@ def genjob(job_id: str, x_dt_key: str = Header(default="")):
                                "Please generate again."})
     return Response(content=content, media_type=media, headers={
         "Content-Disposition": 'attachment; filename="' + fname + '"'})
+
+
+
+# ---------------------------------------------------------------------------
+# Visual Voice Creator (v109, user order 2026-11-20; spec locked 2026-11-13
+# in hidden_files/ai-video-remaker-spec-2026-11-13.md).
+#
+# The user uploads their OWN video. The original visuals are discarded;
+# only the user's own voice is kept — never replaced — and enhanced
+# (sweetness/clarity + a "heavy" echo body) with one of three presets the
+# user picks in the tool:
+#   realistic  — clean presence lift, gentle compression, a touch of echo
+#   dheema     — slower (atempo 0.92) and calmer: softer top, more echo
+#   aesthetic  — warmer low end, wider two-tap echo
+# Behind the voice runs a slideshow of 2-4 pictures splitting the total
+# duration EQUALLY, each with a slow Ken Burns zoom. Pictures come from a
+# bundled set (vvcimg/islamic, vvcimg/nature — AI-generated artwork, no
+# people) or from the user's own uploads (POST /vvcimg with a token the
+# site generates; POST /vvccap optionally leaves a captions SRT under the
+# same token). Captions, when present, are burned in with libass using
+# the bundled Noto fonts (vvcimg/fonts) so Arabic/Urdu shaping is right.
+#
+# POST /vvc is a job, like /genvideo: it returns {"job": id} at once and
+# the finished MP4 is collected through the existing GET /genjob/<id>.
+# The free engine is weak (0.25 CPU, hourly restarts), so inputs are
+# capped at ~5 minutes and renders use fast presets; the worker also
+# heartbeats the job's creation time at segment boundaries so the gen
+# housekeeping TTL (15 min) cannot reap a long-but-healthy render.
+# ---------------------------------------------------------------------------
+VVC_DIR = "/tmp/dt-vvc"
+VVC_WORK = "/tmp/dt-vvcwork"
+VVCIMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vvcimg")
+VVC_MAX_BYTES = 60 * 1024 * 1024     # uploaded video cap
+VVC_IMG_MAX = 8 * 1024 * 1024        # one uploaded picture cap
+VVC_MAX_DUR = 320.0                  # seconds (~5 min + a little slack)
+VVC_FPS = 24
+
+VVC_VOICE_FILTERS = {
+    # Sweetness = presence/clarity lift + a warm low-mid body; heavy =
+    # a short echo under the voice; loudnorm evens the level out.
+    "realistic": (
+        "highpass=f=70,"
+        "equalizer=f=280:t=q:w=1.2:g=2,"
+        "equalizer=f=3200:t=q:w=1:g=3,"
+        "acompressor=threshold=-18dB:ratio=3:attack=20:release=250,"
+        "aecho=0.8:0.7:60:0.14,"
+        "loudnorm=I=-15:TP=-1.5:LRA=11"),
+    "dheema": (
+        "atempo=0.92,"
+        "highpass=f=70,"
+        "equalizer=f=280:t=q:w=1.2:g=2,"
+        "equalizer=f=3200:t=q:w=1:g=1.5,"
+        "acompressor=threshold=-20dB:ratio=2.5:attack=30:release=300,"
+        "aecho=0.8:0.75:90:0.2,"
+        "loudnorm=I=-16:TP=-1.5:LRA=11"),
+    "aesthetic": (
+        "highpass=f=60,"
+        "lowshelf=f=200:g=3,"
+        "equalizer=f=3000:t=q:w=1:g=2,"
+        "acompressor=threshold=-18dB:ratio=3:attack=20:release=250,"
+        "aecho=0.85:0.8:110|55:0.24|0.12,"
+        "loudnorm=I=-15:TP=-1.5:LRA=11"),
+}
+
+
+def _vvc_token_dir(token):
+    """Uploads for one VVC session live under /tmp/dt-vvc/<token>/ —
+    the token is a client-generated hex string; anything else is
+    rejected so it can never escape the folder."""
+    token = re.sub(r"[^a-f0-9]", "", (token or "").lower())[:32]
+    if len(token) < 8:
+        return None
+    return os.path.join(VVC_DIR, token)
+
+
+def _vvc_sniff_image(raw):
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if raw[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+@app.post("/vvcimg")
+async def vvcimg(request: Request, token: str = "",
+                 x_dt_key: str = Header(default="")):
+    """One of the user's own slideshow pictures for a VVC job (raw body,
+    like /convert). Stored under the session token; /vvc picks them up
+    in upload order. At most 4 pictures per session."""
+    check_key(x_dt_key)
+    tdir = _vvc_token_dir(token)
+    if not tdir:
+        raise HTTPException(400, "bad session token")
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "empty upload")
+    if len(data) > VVC_IMG_MAX:
+        raise HTTPException(413, "image too large (8 MB max)")
+    ext = _vvc_sniff_image(data)
+    if not ext:
+        raise HTTPException(400, "Unsupported image type (use PNG, JPEG or WebP).")
+    os.makedirs(tdir, exist_ok=True)
+    existing = sorted(f for f in os.listdir(tdir) if f.startswith("img"))
+    if len(existing) >= 4:
+        raise HTTPException(400, "too many pictures (4 max)")
+    with open(os.path.join(tdir, "img%d%s" % (len(existing), ext)), "wb") as fh:
+        fh.write(data)
+    return {"ok": True, "count": len(existing) + 1}
+
+
+@app.post("/vvccap")
+def vvccap(payload: dict, x_dt_key: str = Header(default="")):
+    """The captions SRT the site prepared for a VVC job (transcript +
+    optional translation, evenly timed by the site), stored under the
+    session token for /vvc to burn in."""
+    check_key(x_dt_key)
+    tdir = _vvc_token_dir(str(payload.get("token") or ""))
+    if not tdir:
+        raise HTTPException(400, "bad session token")
+    srt = str(payload.get("srt") or "")
+    if not srt.strip():
+        raise HTTPException(400, "no captions given")
+    if len(srt.encode("utf-8")) > 200 * 1024:
+        raise HTTPException(413, "captions too large")
+    os.makedirs(tdir, exist_ok=True)
+    with open(os.path.join(tdir, "caps.srt"), "w", encoding="utf-8") as fh:
+        fh.write(srt)
+    return {"ok": True}
+
+
+def _vvc_run(cmd, timeout, cwd=None):
+    import subprocess
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                              cwd=cwd)
+    except Exception as e:
+        raise _GenFail("A rendering step could not start. Please try again.")
+    if proc.returncode != 0:
+        tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+        raise _GenFail("Rendering failed: " + tail.strip()[-200:])
+
+
+def _vvc_probe(path):
+    """(duration_s, width, height, has_audio) via ffprobe; duration and
+    dimensions fall back to 0 when the probe cannot read them."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration:stream=codec_type,width,height",
+             "-of", "json", path],
+            capture_output=True, timeout=30)
+        info = _json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
+    except Exception:
+        return 0.0, 0, 0, False
+    dur = 0.0
+    try:
+        dur = float((info.get("format") or {}).get("duration") or 0)
+    except Exception:
+        dur = 0.0
+    w = h = 0
+    has_audio = False
+    for st in info.get("streams") or []:
+        if st.get("codec_type") == "audio":
+            has_audio = True
+        elif st.get("codec_type") == "video" and not w:
+            w = int(st.get("width") or 0)
+            h = int(st.get("height") or 0)
+    return dur, w, h, has_audio
+
+
+def _vvc_worker(job_id, src_path, voicestyle, visualset, token, npics):
+    import shutil
+    import subprocess  # noqa: F401  (kept local like /convert's imports)
+    workdir = os.path.join(VVC_WORK, job_id)
+    tdir = _vvc_token_dir(token) if token else None
+    detail = "The video could not be created. Please try again."
+
+    def heartbeat():
+        with _gen_lock:
+            job = _gen_jobs.get(job_id)
+            if job:
+                job["created"] = time.time()
+
+    try:
+        os.makedirs(workdir, exist_ok=True)
+        dur, w, h, has_audio = _vvc_probe(src_path)
+        if not has_audio:
+            raise _GenFail(
+                "This video has no sound, so there is no voice to keep. "
+                "Please choose a video with the voice recorded in it.")
+        if dur <= 0:
+            raise _GenFail("This video file could not be read. "
+                           "Please try another file.")
+        if dur > VVC_MAX_DUR:
+            raise _GenFail(
+                "This video is longer than 5 minutes. Please choose a "
+                "shorter video — the free engine cannot render long ones.")
+        portrait = h >= w
+        W, H = (720, 1280) if portrait else (1280, 720)
+
+        # 1) The user's own voice, enhanced (never replaced).
+        audio_path = os.path.join(workdir, "voice.m4a")
+        _vvc_run(["ffmpeg", "-y", "-i", src_path, "-vn",
+                  "-af", VVC_VOICE_FILTERS[voicestyle],
+                  "-c:a", "aac", "-b:a", "128k", audio_path], 420)
+        adur, _, _, _ = _vvc_probe(audio_path)
+        if adur <= 0:
+            adur = dur
+
+        # 2) The pictures: the user's uploads, or a bundled set.
+        if visualset == "photos":
+            if not tdir or not os.path.isdir(tdir):
+                raise _GenFail("Your photos could not be found. "
+                               "Please upload them again.")
+            imgs = [os.path.join(tdir, f) for f in sorted(os.listdir(tdir))
+                    if f.startswith("img")]
+            if len(imgs) < 2:
+                raise _GenFail("Please upload at least 2 photos.")
+            imgs = imgs[:4]
+            npics = len(imgs)
+        else:
+            setdir = os.path.join(VVCIMG_DIR, visualset)
+            pool = []
+            if os.path.isdir(setdir):
+                pool = [os.path.join(setdir, f)
+                        for f in sorted(os.listdir(setdir))
+                        if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+            if not pool:
+                raise _GenFail("The picture set is unavailable right now. "
+                               "Please try again later.")
+            imgs = [pool[i % len(pool)] for i in range(npics)]
+
+        # 3) One silent segment per picture, splitting the (enhanced)
+        #    audio duration equally, each with a slow Ken Burns zoom —
+        #    zooming in and out alternately so it never feels static.
+        seg = adur / float(npics)
+        frames = max(VVC_FPS, int(round(seg * VVC_FPS)))
+        preset = "veryfast" if seg <= 60 else "ultrafast"
+        listpath = os.path.join(workdir, "list.txt")
+        with open(listpath, "w", encoding="utf-8") as lf:
+            for i, img in enumerate(imgs):
+                if i % 2 == 0:
+                    z = "min(1.0+0.10*on/%d,1.10)" % frames
+                else:
+                    z = "max(1.10-0.10*on/%d,1.0)" % frames
+                vf = (
+                    "scale=%d:%d:force_original_aspect_ratio=increase,"
+                    "crop=%d:%d,"
+                    "zoompan=z='%s':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                    ":d=%d:s=%dx%d:fps=%d,format=yuv420p"
+                    % (2 * W, 2 * H, 2 * W, 2 * H, z, frames, W, H, VVC_FPS))
+                segpath = os.path.join(workdir, "seg%d.mp4" % i)
+                _vvc_run(["ffmpeg", "-y", "-i", img, "-vf", vf,
+                          "-frames:v", str(frames),
+                          "-c:v", "libx264", "-preset", preset,
+                          "-crf", "21", segpath], 900)
+                lf.write("file 'seg%d.mp4'\n" % i)
+                heartbeat()
+        joined = os.path.join(workdir, "joined.mp4")
+        _vvc_run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                  "-i", listpath, "-c", "copy", joined], 300)
+
+        # 4) Mux the voice back; burn captions in when the site sent any.
+        final = os.path.join(workdir, "final.mp4")
+        caps = None
+        if tdir:
+            cand = os.path.join(tdir, "caps.srt")
+            if os.path.exists(cand):
+                caps = os.path.join(workdir, "caps.srt")
+                shutil.copyfile(cand, caps)
+        if caps:
+            style = ("FontName=Noto Sans Arabic,FontSize=16,"
+                     "PrimaryColour=&HFFFFFF,BorderStyle=3,"
+                     "BackColour=&H990B5563,Outline=6,Shadow=0,"
+                     "Alignment=2,MarginV=28")
+            vf = ("subtitles=caps.srt:fontsdir="
+                  + os.path.join(VVCIMG_DIR, "fonts")
+                  + ":force_style='" + style + "'")
+            _vvc_run(["ffmpeg", "-y", "-i", joined, "-i", audio_path,
+                      "-vf", vf, "-c:v", "libx264", "-preset", "veryfast",
+                      "-crf", "21", "-c:a", "aac", "-b:a", "128k",
+                      "-shortest", "-movflags", "+faststart", final],
+                     1200, cwd=workdir)
+        else:
+            _vvc_run(["ffmpeg", "-y", "-i", joined, "-i", audio_path,
+                      "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                      "-shortest", "-movflags", "+faststart", final], 600)
+
+        dest = os.path.join(GEN_DIR, job_id + ".mp4")
+        shutil.move(final, dest)
+        with _gen_lock:
+            job = _gen_jobs.get(job_id)
+            if job:
+                job.update(state="done", path=dest, media="video/mp4",
+                           filename="dahot-visual-voice.mp4")
+    except _GenFail as e:
+        detail = e.detail
+        with _gen_lock:
+            job = _gen_jobs.get(job_id)
+            if job:
+                job.update(state="error", detail=detail)
+    except Exception:
+        with _gen_lock:
+            job = _gen_jobs.get(job_id)
+            if job:
+                job.update(state="error", detail=detail)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(workdir, ignore_errors=True)
+        try:
+            os.remove(src_path)
+        except Exception:
+            pass
+        if tdir:
+            _sh.rmtree(tdir, ignore_errors=True)
+
+
+@app.post("/vvc")
+async def vvc(request: Request, voicestyle: str = "realistic",
+              visualset: str = "islamic", token: str = "", npics: int = 3,
+              name: str = "video", x_dt_key: str = Header(default="")):
+    """Visual Voice Creator: the user's video (raw body, like /convert)
+    + options in the query string -> {"job": id}; poll /genjob/<id> for
+    the finished MP4. For visualset="photos" the pictures (and optional
+    captions) must already sit under the session token (see /vvcimg and
+    /vvccap)."""
+    check_key(x_dt_key)
+    voicestyle = (voicestyle or "realistic").lower()
+    if voicestyle not in VVC_VOICE_FILTERS:
+        voicestyle = "realistic"
+    visualset = (visualset or "islamic").lower()
+    if visualset not in ("islamic", "nature", "photos"):
+        raise HTTPException(400, "bad visual style")
+    try:
+        npics = int(npics or 3)
+    except Exception:
+        npics = 3
+    npics = max(2, min(npics, 4))
+    if visualset == "photos":
+        tdir = _vvc_token_dir(token)
+        if not tdir or not os.path.isdir(tdir):
+            raise HTTPException(400, "photos missing — upload them first")
+        have = [f for f in os.listdir(tdir) if f.startswith("img")]
+        if len(have) < 2:
+            raise HTTPException(400, "upload at least 2 photos first")
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "empty upload")
+    if len(data) > VVC_MAX_BYTES:
+        raise HTTPException(413, "file too large (60 MB max)")
+    with _gen_lock:
+        _gen_housekeeping_locked()
+        active = sum(1 for j in _gen_jobs.values() if j["state"] == "working")
+        if active >= GEN_MAX_ACTIVE:
+            raise HTTPException(
+                503, "The creation service is busy right now — "
+                     "please try again in a moment.")
+        job_id = _uuid.uuid4().hex[:16]
+        _gen_jobs[job_id] = {"id": job_id, "kind": "video",
+                             "state": "working", "created": time.time(),
+                             "path": None, "media": None, "filename": None,
+                             "detail": None}
+    src_path = os.path.join(GEN_DIR, "vvcin-" + job_id + ".bin")
+    with open(src_path, "wb") as fh:
+        fh.write(data)
+    _threading.Thread(target=_vvc_worker,
+                      args=(job_id, src_path, voicestyle, visualset,
+                            token, npics),
+                      daemon=True).start()
+    return {"job": job_id}
 
 
 if __name__ == "__main__":

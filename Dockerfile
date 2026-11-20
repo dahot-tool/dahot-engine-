@@ -31,6 +31,7 @@ COPY pot/tsconfig.json ./pot/tsconfig.json
 RUN cd pot && npx tsc
 
 COPY app.py .
+COPY vvcimg ./vvcimg
 COPY start.sh .
 
 ENV PORT=7860
